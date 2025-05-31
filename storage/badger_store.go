@@ -5,7 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"qklzl/fsm"
 
 	"github.com/dgraph-io/badger/v3"
 	"go.etcd.io/etcd/raft/v3"
@@ -20,72 +25,143 @@ var (
 	keyHardState   = []byte("hardstate") //硬件状态
 	keyConfState   = []byte("confstate") //配置状态
 	keySnapshot    = []byte("snapshot")
+	keyFirstIndex  = []byte("firstindex")
 
+	prefixSnapshot = []byte("snapshot/")
 	// 错误定义
 	ErrKeyNotFound  = errors.New("key not found")
 	ErrLogCompacted = errors.New("log compacted") //已压缩
 )
 
 const (
-	// GC 相关配置
-	defaultGCInterval     = 10 * time.Minute
-	defaultGCDiscardRatio = 0.5
+	// 默认 GC 间隔
+	defaultGCInterval = 30 * time.Minute
+	// 默认 GC 丢弃比率
+	defaultGCDiscardRatio = 0.7
+	// 默认快照检查间隔
+	defaultSnapshotInterval = 30 * time.Minute
+	// 快照创建通道缓冲区大小
+	snapshotChannelBuffer = 10
+
+	// 默认快照检查间隔
+	defaultSnapshotCheckInterval = 30 * time.Minute
+	// 默认快照阈值（日志条目数）
+	defaultSnapshotCount = 10000
+	// 快照文件后缀和最大数量
+	snapshotSuffix = ".snap"
+	maxSnapshots   = 5 // 保留的最大快照数量
 )
 
-// BadgerConfig BadgerDB 配置
+// BadgerConfig 存储配置
 type BadgerConfig struct {
-	// GC 检查间隔
+	// GC 间隔
 	GCInterval time.Duration
 	// GC 丢弃比率
 	GCDiscardRatio float64
+	// 快照检查间隔
+	SnapshotInterval time.Duration
+	// 触发快照的日志条目数
+	SnapshotCount uint64
 }
 
-// BadgerStorage 实现 etcd Raft 的 Storage 接口
+// BadgerStorage 基于 BadgerDB 的存储实现
 type BadgerStorage struct {
-	db     *badger.DB
-	config BadgerConfig
-	stopCh chan struct{} //停止GC协程的信号通道
+	db             *badger.DB
+	config         BadgerConfig
+	stopCh         chan struct{}
+	snapshotCh     chan struct{}
+	fsm            *fsm.KVStateMachine
+	logEntryCount  uint64
+	isSnapshotting int32
+	mu             sync.RWMutex // 用于保护关闭操作
+	fsmMu          sync.RWMutex // 用于保护FSM操作
+	firstIndex     uint64       // 第一个可用的日志索引
+	appliedIndex   uint64       // 最后应用的日志索引
 }
 
-// NewBadgerStorage 创建新的 Badger 存储适配器，dir 是数据库文件存储的目录路径（如 "./data"）
-func NewBadgerStorage(dir string, config *BadgerConfig) (*BadgerStorage, error) {
+// NewBadgerStorage 创建新的 BadgerDB 存储
+func NewBadgerStorage(dir string, config *BadgerConfig, fsm *fsm.KVStateMachine) (*BadgerStorage, error) {
+	if fsm == nil {
+		return nil, fmt.Errorf("FSM不能为空")
+	}
+
 	if config == nil {
 		config = &BadgerConfig{
-			GCInterval:     defaultGCInterval,
-			GCDiscardRatio: defaultGCDiscardRatio,
+			GCInterval:       defaultGCInterval,
+			GCDiscardRatio:   defaultGCDiscardRatio,
+			SnapshotInterval: defaultSnapshotInterval,
+			SnapshotCount:    10000, // 默认快照阈值
 		}
 	}
 
-	// 配置 BadgerDB
-	//默认选项包括了一些合理的默认值，比如：
-	//纯Go实现
-	//1GB的memtable大小
-	//基于文件的value存储等
+	// 验证配置参数
+	if config.GCInterval < time.Second {
+		return nil, fmt.Errorf("GC间隔不能小于1秒")
+	}
+	if config.SnapshotInterval < time.Second {
+		return nil, fmt.Errorf("快照检查间隔不能小于1秒")
+	}
+	if config.SnapshotCount < 10 {
+		return nil, fmt.Errorf("快照计数不能小于10")
+	}
+
 	opts := badger.DefaultOptions(dir)
-	opts.SyncWrites = true // 启用同步写入以保证持久性，每次写入都会调用 fsync 确保数据落盘，保证持久性，但性能会下降。
+	opts.Logger = nil // 禁用 Badger 的日志输出
 
 	db, err := badger.Open(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	//数据库已经建好了
 	s := &BadgerStorage{
-		db:     db,
-		config: *config,
-		stopCh: make(chan struct{}),
+		db:             db,
+		config:         *config,
+		stopCh:         make(chan struct{}),
+		snapshotCh:     make(chan struct{}, snapshotChannelBuffer),
+		fsm:            fsm,
+		logEntryCount:  0,
+		isSnapshotting: 0,
 	}
 
-	// 启动后台垃圾回收（GC）协程。
+	// 初始化 firstIndex
+	if err := s.initFirstIndex(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// 初始化日志条目计数
+	if err := s.initLogEntryCount(); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// 启动GC协程
 	go s.runGC()
+	// 启动快照检查协程
+	go s.autoCheckSnapshot()
+	// 启动异步快照处理
+	go s.asyncSnapshotHandler()
 
 	return s, nil
 }
 
 // Stop 停止存储服务
 func (s *BadgerStorage) Stop() {
-	close(s.stopCh)
-	s.db.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	select {
+	case <-s.stopCh:
+		// 通道已经关闭，直接返回
+		return
+	default:
+		close(s.stopCh)
+		if s.db != nil {
+			s.db.Close()
+			// 添加短暂延迟，确保文件锁被完全释放
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 // runGC 运行垃圾回收
@@ -110,19 +186,9 @@ func (s *BadgerStorage) runGC() {
 func logKey(index uint64) []byte {
 	buf := make([]byte, len(prefixLogEntry)+8)
 	copy(buf, prefixLogEntry)
-	//将 uint64 按大端序写入字节切片
 	binary.BigEndian.PutUint64(buf[len(prefixLogEntry):], index)
 	return buf
 }
-
-//type Storage interface {
-//    InitialState() (pb.HardState, pb.ConfState, error)5
-//    Entries(lo, hi, maxSize uint64) ([]pb.Entry, error)4
-//    Term(i uint64) (uint64, error)3
-//    LastIndex() (uint64, error)2
-//    FirstIndex() (uint64, error)1
-//    Snapshot() (pb.Snapshot, error)6
-//}
 
 // InitialState 返回初始的硬状态和配置状态
 // 作用：返回 Raft 节点的初始状态（硬状态 + 配置状态）。
@@ -195,93 +261,67 @@ func (s *BadgerStorage) InitialState() (raftpb.HardState, raftpb.ConfState, erro
 	return hardState, confState, nil
 }
 
-// Entries 获取指定范围内的日志条目
-func (s *BadgerStorage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
-	// 检查索引范围的有效性
+// Entries 获取指定范围的日志条目
+func (s *BadgerStorage) Entries(lo, hi uint64, maxSize uint64) ([]raftpb.Entry, error) {
+	// 检查范围的有效性
 	if lo > hi {
-		return nil, fmt.Errorf("invalid range: lo(%d) > hi(%d)", lo, hi)
+		return nil, fmt.Errorf("无效的日志范围: lo %d > hi %d", lo, hi)
 	}
 
 	firstIndex, err := s.FirstIndex()
 	if err != nil {
 		return nil, err
 	}
-
 	lastIndex, err := s.LastIndex()
 	if err != nil {
 		return nil, err
 	}
 
-	// 处理压缩的情况
+	// raft 规范：lo < firstIndex 返回 ErrLogCompacted
 	if lo < firstIndex {
 		return nil, ErrLogCompacted
 	}
-
-	// 处理越界的情况
-	if hi > lastIndex+1 {
-		return nil, fmt.Errorf("entries index out of range [%d, %d)", lo, hi)
+	// raft 规范：hi > lastIndex+1 或 lo > lastIndex 返回 raft.ErrUnavailable
+	if hi > lastIndex+1 || lo > lastIndex {
+		return nil, raft.ErrUnavailable
 	}
-
-	// 处理无新条目的情况
-	if lo == hi {
+	// raft 规范：lo >= hi 返回空切片和 nil
+	if lo >= hi {
 		return nil, nil
 	}
 
 	var entries []raftpb.Entry
-	var entriesSize uint64
+	var size uint64
 
 	err = s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefixLogEntry
-		opts.PrefetchValues = true
-		opts.PrefetchSize = int(hi - lo)
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		// 定位到起始索引
-		startKey := logKey(lo)
-		it.Seek(startKey)
-
-		for ; it.Valid(); it.Next() {
-			key := it.Item().Key()
-			if !bytes.HasPrefix(key, prefixLogEntry) {
-				break
+		for i := lo; i < hi; i++ {
+			item, err := txn.Get(logKey(i))
+			if err == badger.ErrKeyNotFound {
+				return ErrLogCompacted
 			}
-
-			index := binary.BigEndian.Uint64(key[len(prefixLogEntry):])
-			if index >= hi {
-				break
+			if err != nil {
+				return err
 			}
 
 			var entry raftpb.Entry
-			err := it.Item().Value(func(val []byte) error {
+			err = item.Value(func(val []byte) error {
 				return entry.Unmarshal(val)
 			})
 			if err != nil {
-				return fmt.Errorf("failed to unmarshal log entry at index %d: %v", index, err)
+				return err
 			}
 
-			// 检查大小限制
-			entrySize := uint64(entry.Size())
-			if maxSize > 0 && entries != nil && entriesSize+entrySize > maxSize {
+			size += uint64(entry.Size())
+			if maxSize > 0 && size > maxSize && len(entries) > 0 {
 				break
 			}
-
 			entries = append(entries, entry)
-			entriesSize += entrySize
 		}
-
 		return nil
 	})
 
 	if err != nil {
 		return nil, err
-	}
-
-	// 确保返回至少一个条目（如果存在且未超过大小限制）
-	if len(entries) == 0 && lo <= lastIndex {
-		return nil, fmt.Errorf("missing log entry [%d]", lo)
 	}
 
 	return entries, nil
@@ -357,77 +397,83 @@ func (s *BadgerStorage) Term(i uint64) (uint64, error) {
 	return term, nil
 }
 
-// LastIndex 获取最后一条日志的索引
+// FirstIndex 返回第一个日志条目的索引
+func (s *BadgerStorage) FirstIndex() (uint64, error) {
+	var firstIndex uint64
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keyFirstIndex)
+		if err == nil {
+			return item.Value(func(val []byte) error {
+				var entry raftpb.Entry
+				if err := entry.Unmarshal(val); err != nil {
+					return err
+				}
+				firstIndex = entry.Index
+				return nil
+			})
+		}
+		item, err = txn.Get(keySnapshot)
+		if err == nil {
+			return item.Value(func(val []byte) error {
+				var snapshot raftpb.Snapshot
+				if err := snapshot.Unmarshal(val); err != nil {
+					return err
+				}
+				firstIndex = snapshot.Metadata.Index + 1
+				return nil
+			})
+		}
+		firstIndex = 1
+		return nil
+	})
+	fmt.Printf("[FirstIndex] 返回 firstIndex=%d\n", firstIndex)
+	if err != nil {
+		return 0, err
+	}
+	return firstIndex, nil
+}
+
+// LastIndex 返回最后一个日志条目的索引
 func (s *BadgerStorage) LastIndex() (uint64, error) {
 	var lastIndex uint64
 	err := s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions //DefaultIteratorOptions: 获取默认的迭代器配置
+		item, err := txn.Get(keySnapshot)
+		if err == nil {
+			err = item.Value(func(val []byte) error {
+				var snapshot raftpb.Snapshot
+				if err := snapshot.Unmarshal(val); err != nil {
+					return err
+				}
+				lastIndex = snapshot.Metadata.Index
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		opts := badger.DefaultIteratorOptions
 		opts.Prefix = prefixLogEntry
-		opts.Reverse = true //反向迭代
-
+		opts.Reverse = true
 		it := txn.NewIterator(opts)
 		defer it.Close()
-
-		it.Seek(append(prefixLogEntry, 0xFF)) //从eek() 定位到指定位置开始迭代 append(prefixLogEntry, 0xFF): 构造一个理论上最大的键(0xFF是字节最大值)
-		if it.Valid() {
-			key := it.Item().Key()
-			lastIndex = binary.BigEndian.Uint64(key[len(prefixLogEntry):])
-			return nil
+		for it.Seek(append(append([]byte{}, prefixLogEntry...), 0xFF)); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.Key()
+			if !bytes.HasPrefix(key, prefixLogEntry) {
+				break
+			}
+			index := binary.BigEndian.Uint64(key[len(prefixLogEntry):])
+			if index > lastIndex {
+				lastIndex = index
+			}
 		}
-
-		return ErrKeyNotFound
+		return nil
 	})
-
-	if err == ErrKeyNotFound {
-		// 如果没有日志，尝试从快照获取
-		snapshot, err := s.Snapshot()
-		if err != nil && err != ErrKeyNotFound {
-			return 0, err
-		}
-		if !IsEmptySnap(snapshot) {
-			return snapshot.Metadata.Index, nil
-		}
-		return 0, nil
-	}
-
-	return lastIndex, err
-}
-
-// FirstIndex 获取第一条日志的索引
-func (s *BadgerStorage) FirstIndex() (uint64, error) {
-	// 首先尝试从快照获取
-	snapshot, err := s.Snapshot()
-	if err != nil && err != ErrKeyNotFound {
+	fmt.Printf("[LastIndex] 返回 lastIndex=%d\n", lastIndex)
+	if err != nil {
 		return 0, err
 	}
-	if !IsEmptySnap(snapshot) {
-		return snapshot.Metadata.Index + 1, nil //第一条可用日志是快照最后索引的下一条
-	}
-
-	// 如果没有快照，从日志中获取
-	var firstIndex uint64
-	err = s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefixLogEntry //Prefix 设置为日志键前缀
-
-		it := txn.NewIterator(opts) //迭代器
-		defer it.Close()
-
-		it.Seek(prefixLogEntry)
-		if it.Valid() { //Valid() 检查是否存在数据
-			key := it.Item().Key()
-			firstIndex = binary.BigEndian.Uint64(key[len(prefixLogEntry):])
-			return nil
-		}
-
-		return ErrKeyNotFound
-	})
-	//如果既无快照也无日志，说明是全新存储，返回 1（Raft 日志从索引1开始）
-	if err == ErrKeyNotFound {
-		return 1, nil // 初始状态第一条日志索引为1
-	}
-
-	return firstIndex, err
+	return lastIndex, nil
 }
 
 // Snapshot 获取最新的快照
@@ -436,35 +482,31 @@ func (s *BadgerStorage) Snapshot() (raftpb.Snapshot, error) {
 	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(keySnapshot)
 		if err == badger.ErrKeyNotFound {
-			// 日志记录：没有找到快照
-			fmt.Printf("Info: No snapshot found in storage\n")
+			fmt.Printf("[Snapshot] 没有找到快照\n")
 			return ErrKeyNotFound
 		}
 		if err != nil {
-			// 记录其他错误
-			fmt.Printf("Error retrieving snapshot: %v\n", err)
+			fmt.Printf("[Snapshot] 获取快照出错: %v\n", err)
 			return err
 		}
-
 		return item.Value(func(val []byte) error {
 			if len(val) == 0 {
-				// 记录空快照数据的情况，提供更详细的日志
-				fmt.Printf("Warning: Snapshot key exists but value is empty. " +
-					"This may indicate an incomplete or corrupted snapshot.\n")
+				fmt.Printf("[Snapshot] 快照数据为空\n")
 				return ErrKeyNotFound
 			}
+			fmt.Printf("[Snapshot] 反序列化快照，数据长度=%d\n", len(val))
 			return snapshot.Unmarshal(val)
 		})
 	})
 
-	// 处理不同的错误场景
 	if err == ErrKeyNotFound {
-		return raftpb.Snapshot{}, nil // 返回空快照而不是错误
+		return raftpb.Snapshot{}, nil
 	}
 	if err != nil {
 		return raftpb.Snapshot{}, err
 	}
 
+	fmt.Printf("[Snapshot] 读取到快照 Index=%d, Term=%d\n", snapshot.Metadata.Index, snapshot.Metadata.Term)
 	return snapshot, nil
 }
 
@@ -505,169 +547,261 @@ func (s *BadgerStorage) SaveEntries(entries []raftpb.Entry) error {
 		return nil
 	}
 
-	batch := s.db.NewWriteBatch()
-	defer batch.Cancel()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 使用批量写入
+	wb := s.db.NewWriteBatch()
+	defer wb.Cancel()
 
 	for _, entry := range entries {
-		key := logKey(entry.Index)
 		data, err := entry.Marshal()
 		if err != nil {
-			return err
+			return fmt.Errorf("序列化日志条目失败: %v", err)
 		}
-		if err := batch.Set(key, data); err != nil {
-			return err
+
+		if err := wb.Set(logKey(entry.Index), data); err != nil {
+			return fmt.Errorf("保存日志条目失败: %v", err)
 		}
+		s.IncrementLogEntryCount()
 	}
 
-	return batch.Flush()
+	if err := wb.Flush(); err != nil {
+		return fmt.Errorf("提交批量写入失败: %v", err)
+	}
+
+	fmt.Printf("成功保存 %d 个日志条目\n", len(entries))
+	return nil
 }
 
 // SaveSnapshot 保存快照
 func (s *BadgerStorage) SaveSnapshot(snapshot raftpb.Snapshot) error {
 	if IsEmptySnap(snapshot) {
+		fmt.Println("[SaveSnapshot] 空快照，跳过保存")
 		return nil
 	}
 
+	fmt.Printf("[SaveSnapshot] 保存快照，Index=%d, Term=%d\n", snapshot.Metadata.Index, snapshot.Metadata.Term)
 	data, err := snapshot.Marshal()
 	if err != nil {
+		fmt.Printf("[SaveSnapshot] Marshal 失败: %v\n", err)
 		return err
 	}
 
-	return s.db.Update(func(txn *badger.Txn) error {
+	// 1. 写入数据库
+	err = s.db.Update(func(txn *badger.Txn) error {
+		fmt.Println("[SaveSnapshot] 写入数据库 keySnapshot")
 		return txn.Set(keySnapshot, data)
 	})
+	if err != nil {
+		return err
+	}
+
+	// 2. 写入快照文件（以 Index-Term 命名）
+	dir := s.db.Opts().Dir
+	if dir == "" {
+		dir = "."
+	}
+	fileName := fmt.Sprintf("%016x-%016x.snap", snapshot.Metadata.Index-snapshot.Metadata.Term+1, snapshot.Metadata.Index)
+	filePath := dir + "/" + fileName
+	fmt.Printf("[SaveSnapshot] 写入快照文件: %s\n", filePath)
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		fmt.Printf("[SaveSnapshot] 写入快照文件失败: %v\n", err)
+		return err
+	}
+
+	return nil
 }
 
-// CompactLog 压缩日志，删除指定索引之前的日志
+// CompactLog 压缩指定索引之前的日志
 func (s *BadgerStorage) CompactLog(compactIndex uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 获取当前的第一个索引
 	firstIndex, err := s.FirstIndex()
 	if err != nil {
-		return err
-	}
-	if compactIndex < firstIndex {
-		return nil // 已经压缩过
+		return fmt.Errorf("获取第一个索引失败: %v", err)
 	}
 
+	// 如果压缩点小于或等于第一个索引，不需要压缩
+	if compactIndex <= firstIndex {
+		return nil
+	}
+
+	// 获取最后一个索引
 	lastIndex, err := s.LastIndex()
+	if err != nil {
+		return fmt.Errorf("获取最后一个索引失败: %v", err)
+	}
+
+	// 如果压缩点大于最后一个索引，返回错误
+	if compactIndex > lastIndex {
+		return fmt.Errorf("压缩索引 %d 大于最后一个索引 %d", compactIndex, lastIndex)
+	}
+
+	// 开始批量删除
+	wb := s.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	// 删除从第一个索引到压缩点之前的所有日志
+	deletedCount := uint64(0)
+	for i := firstIndex; i < compactIndex; i++ {
+		if err := wb.Delete(logKey(i)); err != nil {
+			return fmt.Errorf("删除日志条目 %d 失败: %v", i, err)
+		}
+		s.DecrementLogEntryCount()
+		deletedCount++
+	}
+
+	// 更新第一个可用的索引
+	if err := s.saveFirstIndex(compactIndex); err != nil {
+		return fmt.Errorf("更新第一个索引失败: %v", err)
+	}
+
+	// 提交批量删除
+	if err := wb.Flush(); err != nil {
+		return fmt.Errorf("提交批量删除失败: %v", err)
+	}
+
+	// 更新内存中的值
+	atomic.StoreUint64(&s.firstIndex, compactIndex)
+
+	fmt.Printf("成功压缩日志，删除了 %d 个条目，新的第一个索引: %d\n", deletedCount, compactIndex)
+	return nil
+}
+
+// parseLogKey 从日志键中解析索引
+func parseLogKey(key []byte) uint64 {
+	if len(key) < len(prefixLogEntry)+8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(key[len(prefixLogEntry):])
+}
+
+// saveFirstIndex 保存第一个可用的日志索引
+func (s *BadgerStorage) saveFirstIndex(index uint64) error {
+	// 创建一个特殊的Entry来保存索引
+	entry := raftpb.Entry{
+		Index: index,
+		Term:  0, // 使用0作为特殊标记
+	}
+	data, err := entry.Marshal()
+	if err != nil {
+		return fmt.Errorf("序列化索引条目失败: %v", err)
+	}
+
+	// 使用原子写入
+	err = s.db.Update(func(txn *badger.Txn) error {
+		if err := txn.Set(keyFirstIndex, data); err != nil {
+			return fmt.Errorf("保存第一个索引失败: %v", err)
+		}
+		return nil
+	})
+
 	if err != nil {
 		return err
 	}
-	if compactIndex > lastIndex {
-		return fmt.Errorf("compact index %d is out of bound lastindex(%d)", compactIndex, lastIndex)
-	}
 
-	// 获取压缩点的日志条目
-	var entry raftpb.Entry
-	err = s.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(logKey(compactIndex))
+	// 更新内存中的值
+	atomic.StoreUint64(&s.firstIndex, index)
+	return nil
+}
+
+// getLastSnapshotIndex 获取最后一个快照的索引
+func (s *BadgerStorage) getLastSnapshotIndex() (uint64, error) {
+	var index uint64
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keySnapshot)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return entry.Unmarshal(val)
+			var snapshot raftpb.Snapshot
+			if err := snapshot.Unmarshal(val); err != nil {
+				return err
+			}
+			index = snapshot.Metadata.Index
+			return nil
 		})
 	})
-	if err != nil {
-		return err
-	}
+	return index, err
+}
 
-	// 获取当前配置状态
-	confState, err := s.loadConfState()
-	if err != nil && err != ErrKeyNotFound {
-		return err
-	}
-
-	// TODO: 这里需要从状态机获取完整的状态数据
-	// 注意：这需要状态机实现 GetState() 方法来获取序列化的状态
-	// 当前使用空数据作为占位符
-	stateData := []byte{}
-
-	// 创建快照
-	snapshot := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			Index:     compactIndex,
-			Term:      entry.Term,
-			ConfState: confState,
-		},
-		Data: stateData, // 应该使用状态机的完整序列化状态
-	}
-
-	// 保存快照
-	err = s.SaveSnapshot(snapshot)
-	if err != nil {
-		return err
-	}
-
-	// 删除旧的日志条目
-	batch := s.db.NewWriteBatch()
-	defer batch.Cancel()
-
-	err = s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefixLogEntry
-		opts.PrefetchValues = false
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Seek(prefixLogEntry); it.Valid(); it.Next() {
-			key := it.Item().Key()
-			index := binary.BigEndian.Uint64(key[len(prefixLogEntry):])
-			if index < compactIndex {
-				if err := batch.Delete(key); err != nil {
-					return err
-				}
-			}
+// getCurrentTerm 获取当前任期
+func (s *BadgerStorage) getCurrentTerm() uint64 {
+	var term uint64
+	s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keyHardState)
+		if err != nil {
+			return err
 		}
-		return nil
+		return item.Value(func(val []byte) error {
+			var hs raftpb.HardState
+			if err := hs.Unmarshal(val); err != nil {
+				return err
+			}
+			term = hs.Term
+			return nil
+		})
 	})
-
-	if err != nil {
-		return err
-	}
-
-	return batch.Flush()
+	return term
 }
 
 // Append 原子性保存硬状态、配置状态和日志条目
 func (s *BadgerStorage) Append(hs *raftpb.HardState, cs *raftpb.ConfState, entries []raftpb.Entry) error {
-	return s.db.Update(func(txn *badger.Txn) error {
-		// 保存硬状态
-		if hs != nil && !IsEmptyHardState(*hs) {
-			hsData, err := hs.Marshal()
-			if err != nil {
-				return err
-			}
-			if err := txn.Set(keyHardState, hsData); err != nil {
-				return err
-			}
-		}
+	if hs == nil && cs == nil && (entries == nil || len(entries) == 0) {
+		return nil
+	}
 
-		// 保存配置状态
-		if cs != nil && !IsEmptyConfState(*cs) {
-			csData, err := cs.Marshal()
-			if err != nil {
-				return err
-			}
-			if err := txn.Set(keyConfState, csData); err != nil {
-				return err
-			}
-		}
+	wb := s.db.NewWriteBatch()
+	defer wb.Cancel()
 
-		// 保存日志条目
+	// 保存硬状态
+	if hs != nil && !IsEmptyHardState(*hs) {
+		data, err := hs.Marshal()
+		if err != nil {
+			return fmt.Errorf("序列化硬状态失败: %v", err)
+		}
+		if err := wb.Set(keyHardState, data); err != nil {
+			return fmt.Errorf("保存硬状态失败: %v", err)
+		}
+	}
+
+	// 保存配置状态
+	if cs != nil && !IsEmptyConfState(*cs) {
+		data, err := cs.Marshal()
+		if err != nil {
+			return fmt.Errorf("序列化配置状态失败: %v", err)
+		}
+		if err := wb.Set(keyConfState, data); err != nil {
+			return fmt.Errorf("保存配置状态失败: %v", err)
+		}
+	}
+
+	// 保存日志条目
+	if entries != nil && len(entries) > 0 {
 		for _, entry := range entries {
-			key := logKey(entry.Index)
 			data, err := entry.Marshal()
 			if err != nil {
-				return err
+				return fmt.Errorf("序列化日志条目失败: %v", err)
 			}
-			if err := txn.Set(key, data); err != nil {
-				return err
+			if err := wb.Set(logKey(entry.Index), data); err != nil {
+				return fmt.Errorf("保存日志条目失败: %v", err)
 			}
+			s.IncrementLogEntryCount()
 		}
+	}
 
-		return nil
-	})
+	// 提交批量写入
+	if err := wb.Flush(); err != nil {
+		return fmt.Errorf("提交批量写入失败: %v", err)
+	}
+
+	return nil
 }
 
 // loadConfState 加载配置状态
@@ -726,4 +860,276 @@ func IsEmptySnap(sp raftpb.Snapshot) bool {
 // DB 返回底层 BadgerDB 实例
 func (s *BadgerStorage) DB() *badger.DB {
 	return s.db
+}
+
+// SetConfState 设置配置状态
+func (s *BadgerStorage) SetConfState(cs *raftpb.ConfState) error {
+	// 将 ConfState 序列化为字节
+	data, err := cs.Marshal()
+	if err != nil {
+		return err
+	}
+
+	// 写入数据库
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(keyConfState, data)
+	})
+}
+
+// GetConfState 获取配置状态
+func (s *BadgerStorage) GetConfState() (*raftpb.ConfState, error) {
+	var cs raftpb.ConfState
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keyConfState)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			return cs.Unmarshal(val)
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &cs, nil
+}
+
+// SetHardState 设置硬状态
+func (s *BadgerStorage) SetHardState(st *raftpb.HardState) error {
+	// 将 HardState 序列化为字节
+	data, err := st.Marshal()
+	if err != nil {
+		return err
+	}
+
+	// 写入数据库
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(keyHardState, data)
+	})
+}
+
+// GetHardState 获取硬状态
+func (s *BadgerStorage) GetHardState() (*raftpb.HardState, error) {
+	var hs raftpb.HardState
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keyHardState)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			return hs.Unmarshal(val)
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &hs, nil
+}
+
+// writeBatchWithCancel 封装 WriteBatch 的创建和处理
+func (s *BadgerStorage) writeBatchWithCancel(fn func(*badger.WriteBatch) error) error {
+	wb := s.db.NewWriteBatch()
+	var committed bool
+	defer func() {
+		if !committed {
+			wb.Cancel()
+		}
+	}()
+
+	if err := fn(wb); err != nil {
+		return err
+	}
+
+	if err := wb.Flush(); err != nil {
+		return err
+	}
+
+	committed = true
+	return nil
+}
+
+// initLogEntryCount 初始化日志条目计数
+func (s *BadgerStorage) initLogEntryCount() error {
+	count, err := s.countLogEntries()
+	if err != nil {
+		return fmt.Errorf("计算日志条目数量失败: %v", err)
+	}
+
+	atomic.StoreUint64(&s.logEntryCount, count)
+	fmt.Printf("初始化日志条目计数: %d\n", count)
+	return nil
+}
+
+// countLogEntries 计算日志条目数量
+func (s *BadgerStorage) countLogEntries() (uint64, error) {
+	var count uint64
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefixLogEntry
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek(prefixLogEntry); it.Valid(); it.Next() {
+			key := it.Item().Key()
+			if !bytes.HasPrefix(key, prefixLogEntry) {
+				break
+			}
+			count++
+		}
+		return nil
+	})
+
+	return count, err
+}
+
+// IncrementLogEntryCount 增加日志条目计数
+func (s *BadgerStorage) IncrementLogEntryCount() {
+	newCount := atomic.AddUint64(&s.logEntryCount, 1)
+	// 检查是否需要触发快照
+	if newCount >= s.config.SnapshotCount {
+		// 如果已经在创建快照，不重复触发
+		if atomic.LoadInt32(&s.isSnapshotting) == 1 {
+			return
+		}
+		select {
+		case s.snapshotCh <- struct{}{}:
+			// 标记快照创建状态
+			atomic.StoreInt32(&s.isSnapshotting, 1)
+		default:
+			// 如果通道已满，说明已经有快照任务在进行中
+		}
+	}
+}
+
+// DecrementLogEntryCount 减少日志条目计数
+func (s *BadgerStorage) DecrementLogEntryCount() {
+	// 使用原子操作减1，确保不会出现负数
+	for {
+		current := atomic.LoadUint64(&s.logEntryCount)
+		if current == 0 {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&s.logEntryCount, current, current-1) {
+			return
+		}
+	}
+}
+
+// autoCheckSnapshot 定期检查是否需要创建快照
+func (s *BadgerStorage) autoCheckSnapshot() {
+	ticker := time.NewTicker(s.config.SnapshotInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// 触发异步快照创建
+			select {
+			case s.snapshotCh <- struct{}{}:
+			default:
+				// 如果通道已满，忽略
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// asyncSnapshotHandler 异步处理快照创建
+func (s *BadgerStorage) asyncSnapshotHandler() {
+	for {
+		select {
+		case <-s.snapshotCh:
+			// 异步创建快照
+			if err := s.checkAndCreateSnapshot(); err != nil {
+				fmt.Printf("异步快照创建失败: %v\n", err)
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// checkAndCreateSnapshot 检查并创建快照
+func (s *BadgerStorage) checkAndCreateSnapshot() error {
+	if !atomic.CompareAndSwapInt32(&s.isSnapshotting, 0, 1) {
+		return nil // 已经在创建快照
+	}
+	defer atomic.StoreInt32(&s.isSnapshotting, 0)
+
+	// 获取当前日志条目数
+	currentEntryCount := atomic.LoadUint64(&s.logEntryCount)
+	if currentEntryCount < s.config.SnapshotCount {
+		return nil
+	}
+
+	s.fsmMu.RLock() // 保护FSM操作
+	defer s.fsmMu.RUnlock()
+
+	// 创建快照
+	snapshot, err := s.fsm.SaveSnapshot()
+	if err != nil {
+		return fmt.Errorf("创建状态机快照失败: %v", err)
+	}
+
+	// 获取当前应用的索引
+	lastIndex, err := s.LastIndex()
+	if err != nil {
+		return fmt.Errorf("获取最后索引失败: %v", err)
+	}
+
+	// 保存快照
+	if err := s.SaveSnapshot(raftpb.Snapshot{
+		Data: snapshot,
+		Metadata: raftpb.SnapshotMetadata{
+			Index: lastIndex,
+			Term:  s.getCurrentTerm(),
+		},
+	}); err != nil {
+		return fmt.Errorf("保存快照失败: %v", err)
+	}
+
+	return nil
+}
+
+// initFirstIndex 初始化第一个可用的日志索引
+func (s *BadgerStorage) initFirstIndex() error {
+	return s.db.View(func(txn *badger.Txn) error {
+		// 先尝试从专门的键中获取
+		item, err := txn.Get(keyFirstIndex)
+		if err == nil {
+			return item.Value(func(val []byte) error {
+				var entry raftpb.Entry
+				if err := entry.Unmarshal(val); err != nil {
+					return err
+				}
+				s.firstIndex = entry.Index
+				return nil
+			})
+		}
+
+		// 如果找不到，尝试从快照中获取
+		item, err = txn.Get(keySnapshot)
+		if err == nil {
+			return item.Value(func(val []byte) error {
+				var snapshot raftpb.Snapshot
+				if err := snapshot.Unmarshal(val); err != nil {
+					return err
+				}
+				s.firstIndex = snapshot.Metadata.Index + 1
+				return nil
+			})
+		}
+
+		// 如果都没有，设置为1
+		s.firstIndex = 1
+		return nil
+	})
 }

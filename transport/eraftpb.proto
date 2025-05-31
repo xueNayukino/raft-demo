@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package transport;
+
+option go_package = "qklzl/transport";
+
+// MessageType 枚举消息类型
+enum MessageType {
+  MsgUnknown = 0;
+  MsgHup = 1;
+  MsgBeat = 2;
+  MsgProp = 3;
+  MsgApp = 4;
+  MsgAppResp = 5;
+  MsgVote = 6;
+  MsgVoteResp = 7;
+  MsgSnap = 8;
+  MsgHeartbeat = 9;
+  MsgHeartbeatResp = 10;
+  MsgTimeoutNow = 11;
+  MsgReadIndex = 12;
+  MsgReadIndexResp = 13;
+  MsgPreVote = 14;
+  MsgPreVoteResp = 15;
+  MsgSnapChunk = 16;
+  MsgSnapStatus = 17;
+  MsgSnapDone = 18;
+}
+
+// EntryType 枚举日志条目类型
+enum EntryType {
+  EntryNormal = 0;
+  EntryConfChange = 1;
+  EntryConfChangeV2 = 2;
+}
+
+// ConnectionState 连接状态
+enum ConnectionState {
+  Connected = 0;
+  Disconnected = 1;
+  Connecting = 2;
+  Failed = 3;
+  Recovering = 4;
+}
+
+// StreamState 流状态
+enum StreamState {
+  StreamActive = 0;
+  StreamIdle = 1;
+  StreamError = 2;
+  StreamClosed = 3;
+}
+
+// Message 表示一个 Raft 消息
+message Message {
+  MessageType type = 1;        // 消息类型
+  uint64 to = 2;              // 目标节点 ID
+  uint64 from = 3;            // 源节点 ID
+  uint64 term = 4;            // 任期号
+  uint64 log_term = 5;        // 日志条目的任期号
+  uint64 index = 6;           // 日志索引
+  repeated Entry entries = 7;  // 日志条目
+  uint64 commit = 8;          // 已提交的日志索引
+  Snapshot snapshot = 9;      // 快照数据
+  bool reject = 10;           // 是否拒绝
+  uint64 reject_hint = 11;    // 拒绝提示
+  bytes context = 12;         // 上下文数据
+  ConnectionState conn_state = 13;   // 连接状态
+  StreamState stream_state = 14;     // 流状态
+  uint64 sequence = 15;             // 消息序列号
+}
+
+// Entry 表示一个日志条目
+message Entry {
+  uint64 term = 1;       // 任期号
+  uint64 index = 2;      // 日志索引
+  EntryType type = 3;    // 条目类型
+  bytes data = 4;        // 数据
+}
+
+// SnapshotChunk 表示快照的一个数据块
+message SnapshotChunk {
+  bytes data = 1;                    // 块数据
+  uint64 chunk_id = 2;               // 块 ID
+  uint64 total_chunks = 3;           // 总块数
+  uint64 snapshot_id = 4;            // 快照 ID
+  SnapshotMetadata metadata = 5;     // 快照元数据（仅在第一个块中）
+}
+
+// Snapshot 表示一个快照
+message Snapshot {
+  bytes data = 1;                    // 快照数据
+  SnapshotMetadata metadata = 2;     // 快照元数据
+  uint64 snapshot_id = 3;            // 快照 ID
+  uint64 total_size = 4;             // 总大小
+  uint64 chunk_size = 5;             // 块大小
+}
+
+// SnapshotMetadata 表示快照的元数据
+message SnapshotMetadata {
+  ConfState conf_state = 1;  // 配置状态
+  uint64 index = 2;          // 快照对应的日志索引
+  uint64 term = 3;           // 快照对应的任期号
+}
+
+// ConfState 表示集群配置状态
+message ConfState {
+  repeated uint64 voters = 1;    // 投票成员列表
+  repeated uint64 learners = 2;  // 学习者列表
+}
+
+// HeartbeatRequest 心跳请求
+message HeartbeatRequest {
+  uint64 from = 1;
+  uint64 to = 2;
+  uint64 term = 3;
+}
+
+// HeartbeatResponse 心跳响应
+message HeartbeatResponse {
+  bool success = 1;
+  string error = 2;
+  uint64 term = 3;
+  ConnectionState conn_state = 4;
+}
+
+// SnapshotResponse 快照响应
+message SnapshotResponse {
+  bool success = 1;                  // 是否成功
+  string error = 2;                  // 错误信息
+  uint64 chunk_id = 3;               // 已接收的块 ID
+  uint64 snapshot_id = 4;            // 快照 ID
+  ConnectionState conn_state = 5;     // 连接状态
+}
+
+// RaftMessageRequest 包含要发送的 Raft 消息
+message RaftMessageRequest {
+  Message message = 1;
+  uint64 sequence = 2;  // 消息序列号
+}
+
+// RaftMessageResponse 表示消息处理的结果
+message RaftMessageResponse {
+  bool success = 1;
+  string error = 2;
+  ConnectionState conn_state = 3;    // 连接状态
+  StreamState stream_state = 4;      // 流状态
+  uint64 sequence = 5;               // 响应的消息序列号
+}
+
+// RaftService 定义了 Raft 节点间通信的 gRPC 服务
+service RaftService {
+  // SendMessage 用于发送单个 Raft 消息
+  rpc SendMessage(RaftMessageRequest) returns (RaftMessageResponse) {}
+  
+  // StreamMessage 用于建立双向流式消息传输
+  rpc StreamMessage(stream RaftMessageRequest) returns (stream RaftMessageResponse) {}
+
+  // Heartbeat 用于节点心跳
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
+
+  // SendSnapshot 用于传输快照数据块
+  rpc SendSnapshot(stream SnapshotChunk) returns (stream SnapshotResponse) {}
+} 
