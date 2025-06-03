@@ -1109,6 +1109,242 @@ func (x *RaftMessageResponse) GetSequence() uint64 {
 	return 0
 }
 
+// GetLeaderInfoRequest 获取领导者信息请求
+type GetLeaderInfoRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	From          uint64                 `protobuf:"varint,1,opt,name=from,proto3" json:"from,omitempty"`
+	To            uint64                 `protobuf:"varint,2,opt,name=to,proto3" json:"to,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetLeaderInfoRequest) Reset() {
+	*x = GetLeaderInfoRequest{}
+	mi := &file_transport_eraftpb_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetLeaderInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetLeaderInfoRequest) ProtoMessage() {}
+
+func (x *GetLeaderInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_eraftpb_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetLeaderInfoRequest.ProtoReflect.Descriptor instead.
+func (*GetLeaderInfoRequest) Descriptor() ([]byte, []int) {
+	return file_transport_eraftpb_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GetLeaderInfoRequest) GetFrom() uint64 {
+	if x != nil {
+		return x.From
+	}
+	return 0
+}
+
+func (x *GetLeaderInfoRequest) GetTo() uint64 {
+	if x != nil {
+		return x.To
+	}
+	return 0
+}
+
+// GetLeaderInfoResponse 获取领导者信息响应
+type GetLeaderInfoResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LeaderId      uint64                 `protobuf:"varint,1,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	Success       bool                   `protobuf:"varint,3,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetLeaderInfoResponse) Reset() {
+	*x = GetLeaderInfoResponse{}
+	mi := &file_transport_eraftpb_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetLeaderInfoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetLeaderInfoResponse) ProtoMessage() {}
+
+func (x *GetLeaderInfoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_eraftpb_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetLeaderInfoResponse.ProtoReflect.Descriptor instead.
+func (*GetLeaderInfoResponse) Descriptor() ([]byte, []int) {
+	return file_transport_eraftpb_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetLeaderInfoResponse) GetLeaderId() uint64 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *GetLeaderInfoResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *GetLeaderInfoResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *GetLeaderInfoResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// ConfChangeRequest 配置变更请求
+type ConfChangeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	From          uint64                 `protobuf:"varint,1,opt,name=from,proto3" json:"from,omitempty"`
+	To            uint64                 `protobuf:"varint,2,opt,name=to,proto3" json:"to,omitempty"`
+	ConfChange    []byte                 `protobuf:"bytes,3,opt,name=conf_change,json=confChange,proto3" json:"conf_change,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfChangeRequest) Reset() {
+	*x = ConfChangeRequest{}
+	mi := &file_transport_eraftpb_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfChangeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfChangeRequest) ProtoMessage() {}
+
+func (x *ConfChangeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_eraftpb_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfChangeRequest.ProtoReflect.Descriptor instead.
+func (*ConfChangeRequest) Descriptor() ([]byte, []int) {
+	return file_transport_eraftpb_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ConfChangeRequest) GetFrom() uint64 {
+	if x != nil {
+		return x.From
+	}
+	return 0
+}
+
+func (x *ConfChangeRequest) GetTo() uint64 {
+	if x != nil {
+		return x.To
+	}
+	return 0
+}
+
+func (x *ConfChangeRequest) GetConfChange() []byte {
+	if x != nil {
+		return x.ConfChange
+	}
+	return nil
+}
+
+// ConfChangeResponse 配置变更响应
+type ConfChangeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfChangeResponse) Reset() {
+	*x = ConfChangeResponse{}
+	mi := &file_transport_eraftpb_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfChangeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfChangeResponse) ProtoMessage() {}
+
+func (x *ConfChangeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_transport_eraftpb_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfChangeResponse.ProtoReflect.Descriptor instead.
+func (*ConfChangeResponse) Descriptor() ([]byte, []int) {
+	return file_transport_eraftpb_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ConfChangeResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *ConfChangeResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_transport_eraftpb_proto protoreflect.FileDescriptor
 
 const file_transport_eraftpb_proto_rawDesc = "" +
@@ -1189,7 +1425,23 @@ const file_transport_eraftpb_proto_rawDesc = "" +
 	"\n" +
 	"conn_state\x18\x03 \x01(\x0e2\x1a.transport.ConnectionStateR\tconnState\x129\n" +
 	"\fstream_state\x18\x04 \x01(\x0e2\x16.transport.StreamStateR\vstreamState\x12\x1a\n" +
-	"\bsequence\x18\x05 \x01(\x04R\bsequence*\xc7\x02\n" +
+	"\bsequence\x18\x05 \x01(\x04R\bsequence\":\n" +
+	"\x14GetLeaderInfoRequest\x12\x12\n" +
+	"\x04from\x18\x01 \x01(\x04R\x04from\x12\x0e\n" +
+	"\x02to\x18\x02 \x01(\x04R\x02to\"x\n" +
+	"\x15GetLeaderInfoResponse\x12\x1b\n" +
+	"\tleader_id\x18\x01 \x01(\x04R\bleaderId\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x18\n" +
+	"\asuccess\x18\x03 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\"X\n" +
+	"\x11ConfChangeRequest\x12\x12\n" +
+	"\x04from\x18\x01 \x01(\x04R\x04from\x12\x0e\n" +
+	"\x02to\x18\x02 \x01(\x04R\x02to\x12\x1f\n" +
+	"\vconf_change\x18\x03 \x01(\fR\n" +
+	"confChange\"D\n" +
+	"\x12ConfChangeResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error*\xc7\x02\n" +
 	"\vMessageType\x12\x0e\n" +
 	"\n" +
 	"MsgUnknown\x10\x00\x12\n" +
@@ -1234,12 +1486,14 @@ const file_transport_eraftpb_proto_rawDesc = "" +
 	"\n" +
 	"StreamIdle\x10\x01\x12\x0f\n" +
 	"\vStreamError\x10\x02\x12\x10\n" +
-	"\fStreamClosed\x10\x032\xca\x02\n" +
+	"\fStreamClosed\x10\x032\xf1\x03\n" +
 	"\vRaftService\x12N\n" +
 	"\vSendMessage\x12\x1d.transport.RaftMessageRequest\x1a\x1e.transport.RaftMessageResponse\"\x00\x12T\n" +
 	"\rStreamMessage\x12\x1d.transport.RaftMessageRequest\x1a\x1e.transport.RaftMessageResponse\"\x00(\x010\x01\x12H\n" +
 	"\tHeartbeat\x12\x1b.transport.HeartbeatRequest\x1a\x1c.transport.HeartbeatResponse\"\x00\x12K\n" +
-	"\fSendSnapshot\x12\x18.transport.SnapshotChunk\x1a\x1b.transport.SnapshotResponse\"\x00(\x010\x01B\x11Z\x0fqklzl/transportb\x06proto3"
+	"\fSendSnapshot\x12\x18.transport.SnapshotChunk\x1a\x1b.transport.SnapshotResponse\"\x00(\x010\x01\x12T\n" +
+	"\rGetLeaderInfo\x12\x1f.transport.GetLeaderInfoRequest\x1a .transport.GetLeaderInfoResponse\"\x00\x12O\n" +
+	"\x0eSendConfChange\x12\x1c.transport.ConfChangeRequest\x1a\x1d.transport.ConfChangeResponse\"\x00B\x11Z\x0fqklzl/transportb\x06proto3"
 
 var (
 	file_transport_eraftpb_proto_rawDescOnce sync.Once
@@ -1254,23 +1508,27 @@ func file_transport_eraftpb_proto_rawDescGZIP() []byte {
 }
 
 var file_transport_eraftpb_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_transport_eraftpb_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_transport_eraftpb_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_transport_eraftpb_proto_goTypes = []any{
-	(MessageType)(0),            // 0: transport.MessageType
-	(EntryType)(0),              // 1: transport.EntryType
-	(ConnectionState)(0),        // 2: transport.ConnectionState
-	(StreamState)(0),            // 3: transport.StreamState
-	(*Message)(nil),             // 4: transport.Message
-	(*Entry)(nil),               // 5: transport.Entry
-	(*SnapshotChunk)(nil),       // 6: transport.SnapshotChunk
-	(*Snapshot)(nil),            // 7: transport.Snapshot
-	(*SnapshotMetadata)(nil),    // 8: transport.SnapshotMetadata
-	(*ConfState)(nil),           // 9: transport.ConfState
-	(*HeartbeatRequest)(nil),    // 10: transport.HeartbeatRequest
-	(*HeartbeatResponse)(nil),   // 11: transport.HeartbeatResponse
-	(*SnapshotResponse)(nil),    // 12: transport.SnapshotResponse
-	(*RaftMessageRequest)(nil),  // 13: transport.RaftMessageRequest
-	(*RaftMessageResponse)(nil), // 14: transport.RaftMessageResponse
+	(MessageType)(0),              // 0: transport.MessageType
+	(EntryType)(0),                // 1: transport.EntryType
+	(ConnectionState)(0),          // 2: transport.ConnectionState
+	(StreamState)(0),              // 3: transport.StreamState
+	(*Message)(nil),               // 4: transport.Message
+	(*Entry)(nil),                 // 5: transport.Entry
+	(*SnapshotChunk)(nil),         // 6: transport.SnapshotChunk
+	(*Snapshot)(nil),              // 7: transport.Snapshot
+	(*SnapshotMetadata)(nil),      // 8: transport.SnapshotMetadata
+	(*ConfState)(nil),             // 9: transport.ConfState
+	(*HeartbeatRequest)(nil),      // 10: transport.HeartbeatRequest
+	(*HeartbeatResponse)(nil),     // 11: transport.HeartbeatResponse
+	(*SnapshotResponse)(nil),      // 12: transport.SnapshotResponse
+	(*RaftMessageRequest)(nil),    // 13: transport.RaftMessageRequest
+	(*RaftMessageResponse)(nil),   // 14: transport.RaftMessageResponse
+	(*GetLeaderInfoRequest)(nil),  // 15: transport.GetLeaderInfoRequest
+	(*GetLeaderInfoResponse)(nil), // 16: transport.GetLeaderInfoResponse
+	(*ConfChangeRequest)(nil),     // 17: transport.ConfChangeRequest
+	(*ConfChangeResponse)(nil),    // 18: transport.ConfChangeResponse
 }
 var file_transport_eraftpb_proto_depIdxs = []int32{
 	0,  // 0: transport.Message.type:type_name -> transport.MessageType
@@ -1291,12 +1549,16 @@ var file_transport_eraftpb_proto_depIdxs = []int32{
 	13, // 15: transport.RaftService.StreamMessage:input_type -> transport.RaftMessageRequest
 	10, // 16: transport.RaftService.Heartbeat:input_type -> transport.HeartbeatRequest
 	6,  // 17: transport.RaftService.SendSnapshot:input_type -> transport.SnapshotChunk
-	14, // 18: transport.RaftService.SendMessage:output_type -> transport.RaftMessageResponse
-	14, // 19: transport.RaftService.StreamMessage:output_type -> transport.RaftMessageResponse
-	11, // 20: transport.RaftService.Heartbeat:output_type -> transport.HeartbeatResponse
-	12, // 21: transport.RaftService.SendSnapshot:output_type -> transport.SnapshotResponse
-	18, // [18:22] is the sub-list for method output_type
-	14, // [14:18] is the sub-list for method input_type
+	15, // 18: transport.RaftService.GetLeaderInfo:input_type -> transport.GetLeaderInfoRequest
+	17, // 19: transport.RaftService.SendConfChange:input_type -> transport.ConfChangeRequest
+	14, // 20: transport.RaftService.SendMessage:output_type -> transport.RaftMessageResponse
+	14, // 21: transport.RaftService.StreamMessage:output_type -> transport.RaftMessageResponse
+	11, // 22: transport.RaftService.Heartbeat:output_type -> transport.HeartbeatResponse
+	12, // 23: transport.RaftService.SendSnapshot:output_type -> transport.SnapshotResponse
+	16, // 24: transport.RaftService.GetLeaderInfo:output_type -> transport.GetLeaderInfoResponse
+	18, // 25: transport.RaftService.SendConfChange:output_type -> transport.ConfChangeResponse
+	20, // [20:26] is the sub-list for method output_type
+	14, // [14:20] is the sub-list for method input_type
 	14, // [14:14] is the sub-list for extension type_name
 	14, // [14:14] is the sub-list for extension extendee
 	0,  // [0:14] is the sub-list for field type_name
@@ -1313,7 +1575,7 @@ func file_transport_eraftpb_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_transport_eraftpb_proto_rawDesc), len(file_transport_eraftpb_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   11,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

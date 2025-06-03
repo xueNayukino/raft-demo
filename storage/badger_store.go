@@ -76,7 +76,7 @@ type BadgerStorage struct {
 	mu             sync.RWMutex // 用于保护关闭操作
 	fsmMu          sync.RWMutex // 用于保护FSM操作
 	firstIndex     uint64       // 第一个可用的日志索引
-	appliedIndex   uint64       // 最后应用的日志索引
+	appliedIndex   uint64       // 已应用的日志索引
 }
 
 // NewBadgerStorage 创建新的 BadgerDB 存储
@@ -105,8 +105,20 @@ func NewBadgerStorage(dir string, config *BadgerConfig, fsm *fsm.KVStateMachine)
 		return nil, fmt.Errorf("快照计数不能小于10")
 	}
 
+	// 确保目录存在
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("创建目录失败: %v", err)
+	}
+
+	// 不再尝试删除锁文件
+
+	fmt.Printf("打开BadgerDB，目录: %s\n", dir)
 	opts := badger.DefaultOptions(dir)
-	opts.Logger = nil // 禁用 Badger 的日志输出
+	opts.Logger = nil            // 禁用 Badger 的日志输出
+	opts.DetectConflicts = false // 禁用冲突检测，提高性能
+	opts.NumVersionsToKeep = 1   // 只保留一个版本
+	opts.NumCompactors = 2       // 至少需要2个压缩器
+	opts.SyncWrites = false      // 异步写入，提高性能
 
 	db, err := badger.Open(opts)
 	if err != nil {
@@ -158,8 +170,7 @@ func (s *BadgerStorage) Stop() {
 		close(s.stopCh)
 		if s.db != nil {
 			s.db.Close()
-			// 添加短暂延迟，确保文件锁被完全释放
-			time.Sleep(100 * time.Millisecond)
+			// 不再等待锁释放
 		}
 	}
 }
@@ -174,7 +185,8 @@ func (s *BadgerStorage) runGC() {
 		case <-ticker.C:
 			err := s.db.RunValueLogGC(s.config.GCDiscardRatio) //检查哪些 Value Log 文件中的废弃数据比例 ≥ discardRatio（比如 0.7 表示 70% 的数据可丢弃）。 重写这些文件，只保留有效数据，释放磁盘空间，BadgerDB 的 Value Log 是追加写入的，旧数据可能被新数据覆盖或删除，但文件不会自动收缩。
 			if err != nil && err != badger.ErrNoRewrite {
-				fmt.Printf("BadgerDB GC failed: %v\n", err)
+				// 移除调试输出
+				// fmt.Printf("BadgerDB GC failed: %v\n", err)
 			}
 		case <-s.stopCh: //当调用 Stop() 方法时，会执行 close(s.stopCh)，这会向所有监听它的协程发送一个"关闭信号"。
 			return
@@ -196,69 +208,68 @@ func logKey(index uint64) []byte {
 // raftpb.HardState：包含当前任期（Term）、投票结果（Vote）、已提交日志索引（Commit）。
 // raftpb.ConfState：集群成员配置（Voters/Learners）。
 func (s *BadgerStorage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
-	////存储从 BadgerDB 加载的数据
-	var hardState raftpb.HardState
-	var confState raftpb.ConfState
+	var hs raftpb.HardState
+	var cs raftpb.ConfState
 
-	// 加载硬状态
 	err := s.db.View(func(txn *badger.Txn) error {
+		// 1. 获取硬状态
 		item, err := txn.Get(keyHardState)
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
+		if err != nil && err != badger.ErrKeyNotFound {
 			return err
 		}
-		//item：BadgerDB 中表示一个键值对的 Item 对象（通过 Get 或迭代器获取）
-		//回调函数，所有层级返回 nil，外层 err 为 nil，回调模式的优势在于 零拷贝和更简洁的错误传递
-		return item.Value(func(val []byte) error {
-			return hardState.Unmarshal(val)
-		})
-		//hardState 是一个 raftpb.HardState 类型的结构体实例。
-		//Unmarshal 方法会修改 hardState 的字段（如 Term、Vote），将二进制数据 val 解析后填充到该结构体中。
+		if err == nil {
+			err = item.Value(func(val []byte) error {
+				return hs.Unmarshal(val)
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		// 2. 获取配置状态
+		item, err = txn.Get(keyConfState)
+		if err != nil && err != badger.ErrKeyNotFound {
+			return err
+		}
+		if err == nil {
+			err = item.Value(func(val []byte) error {
+				return cs.Unmarshal(val)
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		// 3. 获取快照，确保硬状态的提交索引不小于快照索引
+		item, err = txn.Get(keySnapshot)
+		if err != nil && err != badger.ErrKeyNotFound {
+			return err
+		}
+		if err == nil {
+			err = item.Value(func(val []byte) error {
+				var snapshot raftpb.Snapshot
+				if err := snapshot.Unmarshal(val); err != nil {
+					return err
+				}
+				// 确保提交索引不小于快照索引
+				if hs.Commit < snapshot.Metadata.Index {
+					hs.Commit = snapshot.Metadata.Index
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 
 	if err != nil {
-		return raftpb.HardState{}, raftpb.ConfState{}, err
-	}
-	//Raft 算法的强一致性要求
-	//hardState：包含当前任期（Term）和投票记录（Vote），用于选举和日志一致性。
-	//如果加载失败（如数据损坏），可能导致：
-	//错误任期号引发脑裂（Split Brain）。
-	//丢失投票记录导致重复投票。
-	//confState：包含集群成员（Voters），用于决定哪些节点参与共识。
-	//如果加载失败（且无法从快照恢复），可能导致：
-	//无法识别合法集群成员，破坏安全性。
-	//结论：任一状态损坏都会威胁 Raft 的安全性，必须立即报错终止。
-
-	// 加载配置状态
-	err = s.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(keyConfState)
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		return item.Value(func(val []byte) error {
-			return confState.Unmarshal(val)
-		})
-	})
-
-	if err != nil {
-		return raftpb.HardState{}, raftpb.ConfState{}, err
+		return hs, cs, err
 	}
 
-	// 如果没有配置状态，尝试从快照加载
-	if len(confState.Voters) == 0 {
-		snapshot, err := s.Snapshot()
-		if err == nil && !IsEmptySnap(snapshot) {
-			confState = snapshot.Metadata.ConfState
-		}
-	}
-
-	return hardState, confState, nil
+	return hs, cs, nil
 }
 
 // Entries 获取指定范围的日志条目
@@ -426,7 +437,6 @@ func (s *BadgerStorage) FirstIndex() (uint64, error) {
 		firstIndex = 1
 		return nil
 	})
-	fmt.Printf("[FirstIndex] 返回 firstIndex=%d\n", firstIndex)
 	if err != nil {
 		return 0, err
 	}
@@ -469,7 +479,6 @@ func (s *BadgerStorage) LastIndex() (uint64, error) {
 		}
 		return nil
 	})
-	fmt.Printf("[LastIndex] 返回 lastIndex=%d\n", lastIndex)
 	if err != nil {
 		return 0, err
 	}
@@ -478,35 +487,44 @@ func (s *BadgerStorage) LastIndex() (uint64, error) {
 
 // Snapshot 获取最新的快照
 func (s *BadgerStorage) Snapshot() (raftpb.Snapshot, error) {
+	// 添加数据库状态检查
+	if s.db == nil {
+		return raftpb.Snapshot{}, fmt.Errorf("数据库未初始化")
+	}
+
+	// 检查数据库是否已关闭
+	if s.db.IsClosed() {
+		return raftpb.Snapshot{}, fmt.Errorf("数据库已关闭")
+	}
+
 	var snapshot raftpb.Snapshot
 	err := s.db.View(func(txn *badger.Txn) error {
+		// 添加事务检查
+		if txn == nil {
+			return fmt.Errorf("无效的事务")
+		}
+
 		item, err := txn.Get(keySnapshot)
 		if err == badger.ErrKeyNotFound {
-			fmt.Printf("[Snapshot] 没有找到快照\n")
-			return ErrKeyNotFound
+			return nil // 返回空快照而不是错误
 		}
 		if err != nil {
-			fmt.Printf("[Snapshot] 获取快照出错: %v\n", err)
-			return err
+			return fmt.Errorf("获取快照失败: %v", err)
 		}
+
 		return item.Value(func(val []byte) error {
+			// 添加值检查
 			if len(val) == 0 {
-				fmt.Printf("[Snapshot] 快照数据为空\n")
-				return ErrKeyNotFound
+				return nil // 返回空快照
 			}
-			fmt.Printf("[Snapshot] 反序列化快照，数据长度=%d\n", len(val))
 			return snapshot.Unmarshal(val)
 		})
 	})
 
-	if err == ErrKeyNotFound {
-		return raftpb.Snapshot{}, nil
-	}
 	if err != nil {
 		return raftpb.Snapshot{}, err
 	}
 
-	fmt.Printf("[Snapshot] 读取到快照 Index=%d, Term=%d\n", snapshot.Metadata.Index, snapshot.Metadata.Term)
 	return snapshot, nil
 }
 
@@ -570,47 +588,63 @@ func (s *BadgerStorage) SaveEntries(entries []raftpb.Entry) error {
 		return fmt.Errorf("提交批量写入失败: %v", err)
 	}
 
-	fmt.Printf("成功保存 %d 个日志条目\n", len(entries))
 	return nil
 }
 
 // SaveSnapshot 保存快照
 func (s *BadgerStorage) SaveSnapshot(snapshot raftpb.Snapshot) error {
 	if IsEmptySnap(snapshot) {
-		fmt.Println("[SaveSnapshot] 空快照，跳过保存")
 		return nil
 	}
 
-	fmt.Printf("[SaveSnapshot] 保存快照，Index=%d, Term=%d\n", snapshot.Metadata.Index, snapshot.Metadata.Term)
 	data, err := snapshot.Marshal()
 	if err != nil {
-		fmt.Printf("[SaveSnapshot] Marshal 失败: %v\n", err)
 		return err
 	}
 
 	// 1. 写入数据库
-	err = s.db.Update(func(txn *badger.Txn) error {
-		fmt.Println("[SaveSnapshot] 写入数据库 keySnapshot")
-		return txn.Set(keySnapshot, data)
+	return s.db.Update(func(txn *badger.Txn) error {
+		// 保存快照数据
+		if err := txn.Set(keySnapshot, data); err != nil {
+			return err
+		}
+
+		// 2. 更新硬状态的提交索引
+		item, err := txn.Get(keyHardState)
+		if err != nil && err != badger.ErrKeyNotFound {
+			return err
+		}
+
+		var hs raftpb.HardState
+		if err == nil {
+			err = item.Value(func(val []byte) error {
+				return hs.Unmarshal(val)
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		// 更新提交索引
+		if hs.Commit < snapshot.Metadata.Index {
+			hs.Commit = snapshot.Metadata.Index
+			hsData, err := hs.Marshal()
+			if err != nil {
+				return err
+			}
+			if err := txn.Set(keyHardState, hsData); err != nil {
+				return err
+			}
+		}
+
+		// 3. 更新 firstIndex
+		firstIndex := snapshot.Metadata.Index + 1
+		if err := s.saveFirstIndex(firstIndex); err != nil {
+			return err
+		}
+
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-
-	// 2. 写入快照文件（以 Index-Term 命名）
-	dir := s.db.Opts().Dir
-	if dir == "" {
-		dir = "."
-	}
-	fileName := fmt.Sprintf("%016x-%016x.snap", snapshot.Metadata.Index-snapshot.Metadata.Term+1, snapshot.Metadata.Index)
-	filePath := dir + "/" + fileName
-	fmt.Printf("[SaveSnapshot] 写入快照文件: %s\n", filePath)
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		fmt.Printf("[SaveSnapshot] 写入快照文件失败: %v\n", err)
-		return err
-	}
-
-	return nil
 }
 
 // CompactLog 压缩指定索引之前的日志
@@ -640,6 +674,29 @@ func (s *BadgerStorage) CompactLog(compactIndex uint64) error {
 		return fmt.Errorf("压缩索引 %d 大于最后一个索引 %d", compactIndex, lastIndex)
 	}
 
+	// 获取当前硬状态
+	var hs raftpb.HardState
+	err = s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keyHardState)
+		if err != nil && err != badger.ErrKeyNotFound {
+			return err
+		}
+		if err == nil {
+			return item.Value(func(val []byte) error {
+				return hs.Unmarshal(val)
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("获取硬状态失败: %v", err)
+	}
+
+	// 确保压缩点不大于提交索引，但仅当硬状态不为空且提交索引大于0时才检查
+	if !IsEmptyHardState(hs) && hs.Commit > 0 && compactIndex > hs.Commit {
+		return fmt.Errorf("压缩索引 %d 大于提交索引 %d", compactIndex, hs.Commit)
+	}
+
 	// 开始批量删除
 	wb := s.db.NewWriteBatch()
 	defer wb.Cancel()
@@ -667,7 +724,6 @@ func (s *BadgerStorage) CompactLog(compactIndex uint64) error {
 	// 更新内存中的值
 	atomic.StoreUint64(&s.firstIndex, compactIndex)
 
-	fmt.Printf("成功压缩日志，删除了 %d 个条目，新的第一个索引: %d\n", deletedCount, compactIndex)
 	return nil
 }
 
@@ -762,6 +818,34 @@ func (s *BadgerStorage) Append(hs *raftpb.HardState, cs *raftpb.ConfState, entri
 
 	// 保存硬状态
 	if hs != nil && !IsEmptyHardState(*hs) {
+		// 获取当前快照索引
+		var snapshotIndex uint64
+		err := s.db.View(func(txn *badger.Txn) error {
+			item, err := txn.Get(keySnapshot)
+			if err != nil && err != badger.ErrKeyNotFound {
+				return err
+			}
+			if err == nil {
+				return item.Value(func(val []byte) error {
+					var snapshot raftpb.Snapshot
+					if err := snapshot.Unmarshal(val); err != nil {
+						return err
+					}
+					snapshotIndex = snapshot.Metadata.Index
+					return nil
+				})
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		// 确保提交索引不小于快照索引
+		if hs.Commit < snapshotIndex {
+			hs.Commit = snapshotIndex
+		}
+
 		data, err := hs.Marshal()
 		if err != nil {
 			return fmt.Errorf("序列化硬状态失败: %v", err)
@@ -962,7 +1046,8 @@ func (s *BadgerStorage) initLogEntryCount() error {
 	}
 
 	atomic.StoreUint64(&s.logEntryCount, count)
-	fmt.Printf("初始化日志条目计数: %d\n", count)
+	// 移除调试输出
+	// fmt.Printf("初始化日志条目计数: %d\n", count)
 	return nil
 }
 
@@ -1049,7 +1134,8 @@ func (s *BadgerStorage) asyncSnapshotHandler() {
 		case <-s.snapshotCh:
 			// 异步创建快照
 			if err := s.checkAndCreateSnapshot(); err != nil {
-				fmt.Printf("异步快照创建失败: %v\n", err)
+				// 移除调试输出
+				// fmt.Printf("异步快照创建失败: %v\n", err)
 			}
 		case <-s.stopCh:
 			return
@@ -1093,6 +1179,8 @@ func (s *BadgerStorage) checkAndCreateSnapshot() error {
 			Term:  s.getCurrentTerm(),
 		},
 	}); err != nil {
+		// 移除调试输出
+		// fmt.Printf("异步快照创建失败: %v\n", err)
 		return fmt.Errorf("保存快照失败: %v", err)
 	}
 
@@ -1132,4 +1220,120 @@ func (s *BadgerStorage) initFirstIndex() error {
 		s.firstIndex = 1
 		return nil
 	})
+}
+
+// NewInMemoryBadgerStorage 创建新的内存模式 BadgerDB 存储
+func NewInMemoryBadgerStorage(dir string) (*BadgerStorage, error) {
+	// 创建内存模式的BadgerDB
+	opts := badger.DefaultOptions("").WithInMemory(true)
+	opts.Logger = nil // 禁用日志
+
+	db, err := badger.Open(opts)
+	if err != nil {
+		return nil, fmt.Errorf("打开内存数据库失败: %v", err)
+	}
+
+	// 创建状态机
+	stateMachine := fsm.NewKVStateMachine(db)
+
+	// 创建存储实例
+	s := &BadgerStorage{
+		db: db,
+		config: BadgerConfig{
+			GCInterval:       defaultGCInterval,
+			GCDiscardRatio:   defaultGCDiscardRatio,
+			SnapshotInterval: defaultSnapshotInterval,
+			SnapshotCount:    defaultSnapshotCount,
+		},
+		stopCh:         make(chan struct{}),
+		snapshotCh:     make(chan struct{}, snapshotChannelBuffer),
+		fsm:            stateMachine,
+		logEntryCount:  0,
+		isSnapshotting: 0,
+		firstIndex:     1, // 设置初始索引为1
+	}
+
+	// 启动GC协程
+	go s.runGC()
+	// 启动快照检查协程
+	go s.autoCheckSnapshot()
+	// 启动异步快照处理
+	go s.asyncSnapshotHandler()
+
+	return s, nil
+}
+
+// GetFSM 返回状态机引用
+func (s *BadgerStorage) GetFSM() *fsm.KVStateMachine {
+	return s.fsm
+}
+
+// NewBadgerStorageWithDB 使用已创建的BadgerDB实例创建存储
+func NewBadgerStorageWithDB(dir string, db *badger.DB, config *BadgerConfig, fsm *fsm.KVStateMachine) (*BadgerStorage, error) {
+	if fsm == nil {
+		return nil, fmt.Errorf("FSM不能为空")
+	}
+
+	if db == nil {
+		return nil, fmt.Errorf("BadgerDB实例不能为空")
+	}
+
+	if config == nil {
+		config = &BadgerConfig{
+			GCInterval:       defaultGCInterval,
+			GCDiscardRatio:   defaultGCDiscardRatio,
+			SnapshotInterval: defaultSnapshotInterval,
+			SnapshotCount:    10000, // 默认快照阈值
+		}
+	}
+
+	// 验证配置参数
+	if config.GCInterval < time.Second {
+		return nil, fmt.Errorf("GC间隔不能小于1秒")
+	}
+	if config.SnapshotInterval < time.Second {
+		return nil, fmt.Errorf("快照检查间隔不能小于1秒")
+	}
+	if config.SnapshotCount < 10 {
+		return nil, fmt.Errorf("快照计数不能小于10")
+	}
+
+	s := &BadgerStorage{
+		db:             db,
+		config:         *config,
+		stopCh:         make(chan struct{}),
+		snapshotCh:     make(chan struct{}, snapshotChannelBuffer),
+		fsm:            fsm,
+		logEntryCount:  0,
+		isSnapshotting: 0,
+	}
+
+	// 初始化 firstIndex
+	if err := s.initFirstIndex(); err != nil {
+		return nil, err
+	}
+
+	// 初始化日志条目计数
+	if err := s.initLogEntryCount(); err != nil {
+		return nil, err
+	}
+
+	// 启动GC协程
+	go s.runGC()
+	// 启动快照检查协程
+	go s.autoCheckSnapshot()
+	// 启动异步快照处理
+	go s.asyncSnapshotHandler()
+
+	return s, nil
+}
+
+// GetAppliedIndex 获取已应用的日志索引
+func (s *BadgerStorage) GetAppliedIndex() uint64 {
+	return atomic.LoadUint64(&s.appliedIndex)
+}
+
+// SetAppliedIndex 设置已应用的日志索引
+func (s *BadgerStorage) SetAppliedIndex(index uint64) {
+	atomic.StoreUint64(&s.appliedIndex, index)
 }

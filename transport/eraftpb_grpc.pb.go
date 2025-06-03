@@ -19,10 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RaftService_SendMessage_FullMethodName   = "/transport.RaftService/SendMessage"
-	RaftService_StreamMessage_FullMethodName = "/transport.RaftService/StreamMessage"
-	RaftService_Heartbeat_FullMethodName     = "/transport.RaftService/Heartbeat"
-	RaftService_SendSnapshot_FullMethodName  = "/transport.RaftService/SendSnapshot"
+	RaftService_SendMessage_FullMethodName    = "/transport.RaftService/SendMessage"
+	RaftService_StreamMessage_FullMethodName  = "/transport.RaftService/StreamMessage"
+	RaftService_Heartbeat_FullMethodName      = "/transport.RaftService/Heartbeat"
+	RaftService_SendSnapshot_FullMethodName   = "/transport.RaftService/SendSnapshot"
+	RaftService_GetLeaderInfo_FullMethodName  = "/transport.RaftService/GetLeaderInfo"
+	RaftService_SendConfChange_FullMethodName = "/transport.RaftService/SendConfChange"
 )
 
 // RaftServiceClient is the client API for RaftService service.
@@ -39,6 +41,10 @@ type RaftServiceClient interface {
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	// SendSnapshot 用于传输快照数据块
 	SendSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SnapshotChunk, SnapshotResponse], error)
+	// GetLeaderInfo 获取领导者信息
+	GetLeaderInfo(ctx context.Context, in *GetLeaderInfoRequest, opts ...grpc.CallOption) (*GetLeaderInfoResponse, error)
+	// SendConfChange 发送配置变更请求
+	SendConfChange(ctx context.Context, in *ConfChangeRequest, opts ...grpc.CallOption) (*ConfChangeResponse, error)
 }
 
 type raftServiceClient struct {
@@ -95,6 +101,26 @@ func (c *raftServiceClient) SendSnapshot(ctx context.Context, opts ...grpc.CallO
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RaftService_SendSnapshotClient = grpc.BidiStreamingClient[SnapshotChunk, SnapshotResponse]
 
+func (c *raftServiceClient) GetLeaderInfo(ctx context.Context, in *GetLeaderInfoRequest, opts ...grpc.CallOption) (*GetLeaderInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLeaderInfoResponse)
+	err := c.cc.Invoke(ctx, RaftService_GetLeaderInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *raftServiceClient) SendConfChange(ctx context.Context, in *ConfChangeRequest, opts ...grpc.CallOption) (*ConfChangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ConfChangeResponse)
+	err := c.cc.Invoke(ctx, RaftService_SendConfChange_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServiceServer is the server API for RaftService service.
 // All implementations must embed UnimplementedRaftServiceServer
 // for forward compatibility.
@@ -109,6 +135,10 @@ type RaftServiceServer interface {
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	// SendSnapshot 用于传输快照数据块
 	SendSnapshot(grpc.BidiStreamingServer[SnapshotChunk, SnapshotResponse]) error
+	// GetLeaderInfo 获取领导者信息
+	GetLeaderInfo(context.Context, *GetLeaderInfoRequest) (*GetLeaderInfoResponse, error)
+	// SendConfChange 发送配置变更请求
+	SendConfChange(context.Context, *ConfChangeRequest) (*ConfChangeResponse, error)
 	mustEmbedUnimplementedRaftServiceServer()
 }
 
@@ -130,6 +160,12 @@ func (UnimplementedRaftServiceServer) Heartbeat(context.Context, *HeartbeatReque
 }
 func (UnimplementedRaftServiceServer) SendSnapshot(grpc.BidiStreamingServer[SnapshotChunk, SnapshotResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method SendSnapshot not implemented")
+}
+func (UnimplementedRaftServiceServer) GetLeaderInfo(context.Context, *GetLeaderInfoRequest) (*GetLeaderInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLeaderInfo not implemented")
+}
+func (UnimplementedRaftServiceServer) SendConfChange(context.Context, *ConfChangeRequest) (*ConfChangeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SendConfChange not implemented")
 }
 func (UnimplementedRaftServiceServer) mustEmbedUnimplementedRaftServiceServer() {}
 func (UnimplementedRaftServiceServer) testEmbeddedByValue()                     {}
@@ -202,6 +238,42 @@ func _RaftService_SendSnapshot_Handler(srv interface{}, stream grpc.ServerStream
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RaftService_SendSnapshotServer = grpc.BidiStreamingServer[SnapshotChunk, SnapshotResponse]
 
+func _RaftService_GetLeaderInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLeaderInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).GetLeaderInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_GetLeaderInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).GetLeaderInfo(ctx, req.(*GetLeaderInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RaftService_SendConfChange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConfChangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServiceServer).SendConfChange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftService_SendConfChange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServiceServer).SendConfChange(ctx, req.(*ConfChangeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftService_ServiceDesc is the grpc.ServiceDesc for RaftService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -216,6 +288,14 @@ var RaftService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Heartbeat",
 			Handler:    _RaftService_Heartbeat_Handler,
+		},
+		{
+			MethodName: "GetLeaderInfo",
+			Handler:    _RaftService_GetLeaderInfo_Handler,
+		},
+		{
+			MethodName: "SendConfChange",
+			Handler:    _RaftService_SendConfChange_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

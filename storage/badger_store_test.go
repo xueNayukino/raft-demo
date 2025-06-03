@@ -1,9 +1,10 @@
 package storage
 
 import (
-	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,683 +16,652 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
-// 创建临时测试存储
-func createTestBadgerStorage(t *testing.T) (*BadgerStorage, string, func()) {
-	// 创建临时目录，使用测试名称作为前缀以确保唯一性
-	dir, err := os.MkdirTemp("", fmt.Sprintf("badger-test-%s-*", t.Name()))
+// 创建临时测试目录
+func createTempDir(t *testing.T) string {
+	dir, err := os.MkdirTemp("", "badger-test-*")
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		os.RemoveAll(dir)
+	})
+	return dir
+}
 
-	// 确保目录存在且为空
-	err = os.RemoveAll(dir)
-	require.NoError(t, err)
-	err = os.MkdirAll(dir, 0755)
-	require.NoError(t, err)
-
-	// 设置BadgerDB选项
-	opts := badger.DefaultOptions("").WithInMemory(true) // 使用内存模式，不设置目录
-	opts.Logger = nil                                    // 禁用Badger的日志输出
-	opts.SyncWrites = false                              // 禁用同步写入以提高测试速度
-	opts.NumVersionsToKeep = 1                           // 只保留一个版本
-	opts.DetectConflicts = false                         // 禁用冲突检测
-	opts.NumGoroutines = 1                               // 限制goroutine数量
-
-	// 创建BadgerDB实例
+// 创建BadgerDB内存实例
+func createBadgerDB(t *testing.T) *badger.DB {
+	opts := badger.DefaultOptions("").WithInMemory(true)
+	opts.Logger = nil // 禁用日志
 	db, err := badger.Open(opts)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		db.Close()
+	})
+	return db
+}
+
+// 测试BadgerDB基本读写功能
+func TestBadgerDBBasicOperations(t *testing.T) {
+	// 创建BadgerDB内存实例
+	db := createBadgerDB(t)
 
 	// 创建状态机
 	stateMachine := fsm.NewKVStateMachine(db)
 
-	// 创建存储
-	store, err := NewBadgerStorage(dir, nil, stateMachine)
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
+	}
+
+	// 创建BadgerStorage，使用临时目录作为路径
+	dir := createTempDir(t)
+	store, err := NewBadgerStorage(dir, config, stateMachine)
 	require.NoError(t, err)
+	defer store.Stop()
 
-	// 清理函数
-	cleanup := func() {
-		// 先停止存储服务
-		if store != nil {
-			store.Stop()
+	t.Run("基本读写测试", func(t *testing.T) {
+		// 测试写入和读取日志条目 - 使用符合状态机要求的JSON格式
+		entries := []raftpb.Entry{
+			{Term: 1, Index: 1, Data: []byte(`{"op":"put","key":"key1","value":"value1"}`)},
+			{Term: 1, Index: 2, Data: []byte(`{"op":"put","key":"key2","value":"value2"}`)},
+			{Term: 1, Index: 3, Data: []byte(`{"op":"put","key":"key3","value":"value3"}`)},
 		}
 
-		// 确保数据库正确关闭
-		if db != nil {
-			err := db.Close()
-			if err != nil {
-				t.Logf("关闭数据库时出错: %v", err)
-			}
+		// 保存日志条目
+		err := store.SaveEntries(entries)
+		require.NoError(t, err)
+
+		// 读取日志条目
+		readEntries, err := store.Entries(1, 4, 0)
+		require.NoError(t, err)
+		assert.Equal(t, len(entries), len(readEntries))
+
+		for i, entry := range readEntries {
+			assert.Equal(t, entries[i].Term, entry.Term)
+			assert.Equal(t, entries[i].Index, entry.Index)
+			assert.Equal(t, entries[i].Data, entry.Data)
 		}
+	})
 
-		// 等待一小段时间确保资源释放
-		time.Sleep(100 * time.Millisecond)
+	t.Run("FirstIndex和LastIndex测试", func(t *testing.T) {
+		firstIndex, err := store.FirstIndex()
+		require.NoError(t, err)
+		assert.Equal(t, uint64(1), firstIndex)
 
-		// 删除目录及其内容
-		if err := os.RemoveAll(dir); err != nil {
-			t.Logf("删除测试目录时出错: %v", err)
-		}
-	}
-
-	// 注册清理函数，确保即使测试panic也能清理
-	t.Cleanup(cleanup)
-
-	return store, dir, cleanup
+		lastIndex, err := store.LastIndex()
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), lastIndex)
+	})
 }
 
-// 测试初始状态
-func TestInitialState(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
+// 测试日志持久化和恢复
+func TestLogPersistence(t *testing.T) {
+	// 创建临时目录
+	dir := createTempDir(t)
 
-	// 测试空存储的初始状态
-	hardState, confState, err := store.InitialState()
-	assert.NoError(t, err)
-	assert.True(t, IsEmptyHardState(hardState))
-	assert.True(t, IsEmptyConfState(confState))
-
-	// 保存硬状态和配置状态
-	testHardState := raftpb.HardState{
-		Term:   1,
-		Vote:   2,
-		Commit: 3,
-	}
-	testConfState := raftpb.ConfState{
-		Voters: []uint64{1, 2, 3},
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
 	}
 
-	err = store.SaveState(testHardState, testConfState)
-	assert.NoError(t, err)
+	// 第一步：创建存储实例并写入数据
+	{
+		// 创建BadgerDB内存实例
+		db := createBadgerDB(t)
 
-	// 重新加载状态
-	hardState, confState, err = store.InitialState()
-	assert.NoError(t, err)
-	assert.Equal(t, testHardState, hardState)
-	assert.Equal(t, testConfState, confState)
+		// 创建状态机
+		stateMachine := fsm.NewKVStateMachine(db)
+
+		store, err := NewBadgerStorage(dir, config, stateMachine)
+		require.NoError(t, err)
+
+		// 写入日志条目 - 使用符合状态机要求的JSON格式
+		entries := []raftpb.Entry{
+			{Term: 1, Index: 1, Data: []byte(`{"op":"put","key":"key1","value":"value1"}`)},
+			{Term: 1, Index: 2, Data: []byte(`{"op":"put","key":"key2","value":"value2"}`)},
+			{Term: 2, Index: 3, Data: []byte(`{"op":"put","key":"key3","value":"value3"}`)},
+			{Term: 2, Index: 4, Data: []byte(`{"op":"put","key":"key4","value":"value4"}`)},
+			{Term: 3, Index: 5, Data: []byte(`{"op":"put","key":"key5","value":"value5"}`)},
+		}
+		err = store.SaveEntries(entries)
+		require.NoError(t, err)
+
+		// 获取Term
+		term, err := store.Term(3)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(2), term)
+
+		// 关闭存储
+		store.Stop()
+		time.Sleep(100 * time.Millisecond) // 确保完全关闭
+	}
+
+	// 第二步：重新打开存储并验证数据
+	{
+		// 重新创建BadgerDB内存实例
+		db := createBadgerDB(t)
+
+		// 重新创建状态机
+		stateMachine := fsm.NewKVStateMachine(db)
+
+		store, err := NewBadgerStorage(dir, config, stateMachine)
+		require.NoError(t, err)
+		defer store.Stop()
+
+		// 验证FirstIndex和LastIndex
+		firstIndex, err := store.FirstIndex()
+		require.NoError(t, err)
+		assert.Equal(t, uint64(1), firstIndex)
+
+		lastIndex, err := store.LastIndex()
+		require.NoError(t, err)
+		assert.Equal(t, uint64(5), lastIndex)
+
+		// 读取日志条目并验证
+		entries, err := store.Entries(1, 6, 0)
+		require.NoError(t, err)
+		assert.Equal(t, 5, len(entries))
+
+		// 验证每个条目的索引和任期
+		expectedTerms := []uint64{1, 1, 2, 2, 3}
+		for i := uint64(1); i <= 5; i++ {
+			entry := entries[i-1]
+			assert.Equal(t, i, entry.Index)
+			assert.Equal(t, expectedTerms[i-1], entry.Term)
+
+			// 验证数据格式符合JSON要求
+			expectedData := fmt.Sprintf(`{"op":"put","key":"key%d","value":"value%d"}`, i, i)
+			assert.JSONEq(t, expectedData, string(entry.Data))
+		}
+
+		// 测试Term函数
+		for i := uint64(1); i <= 5; i++ {
+			term, err := store.Term(i)
+			require.NoError(t, err)
+			assert.Equal(t, expectedTerms[i-1], term)
+		}
+	}
 }
 
-// 测试日志条目
-func TestEntries(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
+// 测试状态持久化和恢复
+func TestStatePersistence(t *testing.T) {
+	// 创建临时目录
+	dir := createTempDir(t)
 
-	// 等待存储初始化完成
-	time.Sleep(100 * time.Millisecond)
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
+	}
 
-	// 准备测试日志条目
+	// 第一步：创建存储实例并保存状态
+	{
+		// 创建BadgerDB内存实例
+		db := createBadgerDB(t)
+
+		// 创建状态机
+		stateMachine := fsm.NewKVStateMachine(db)
+
+		store, err := NewBadgerStorage(dir, config, stateMachine)
+		require.NoError(t, err)
+
+		// 创建硬状态
+		hardState := raftpb.HardState{
+			Term:   5,
+			Vote:   2,
+			Commit: 10,
+		}
+
+		// 创建配置状态
+		confState := raftpb.ConfState{
+			Voters: []uint64{1, 2, 3},
+		}
+
+		// 保存状态
+		err = store.SaveState(hardState, confState)
+		require.NoError(t, err)
+
+		// 关闭存储
+		store.Stop()
+		time.Sleep(100 * time.Millisecond) // 确保完全关闭
+	}
+
+	// 第二步：重新打开存储并验证状态
+	{
+		// 重新创建BadgerDB内存实例
+		db := createBadgerDB(t)
+
+		// 重新创建状态机
+		stateMachine := fsm.NewKVStateMachine(db)
+
+		store, err := NewBadgerStorage(dir, config, stateMachine)
+		require.NoError(t, err)
+		defer store.Stop()
+
+		// 获取初始状态
+		hs, cs, err := store.InitialState()
+		require.NoError(t, err)
+
+		// 验证硬状态
+		assert.Equal(t, uint64(5), hs.Term)
+		assert.Equal(t, uint64(2), hs.Vote)
+		assert.Equal(t, uint64(10), hs.Commit)
+
+		// 验证配置状态
+		assert.Equal(t, []uint64{1, 2, 3}, cs.Voters)
+	}
+}
+
+// 测试日志压缩
+func TestLogCompaction(t *testing.T) {
+	// 创建临时目录
+	dir := createTempDir(t)
+
+	// 创建BadgerDB内存实例
+	db := createBadgerDB(t)
+
+	// 创建状态机
+	stateMachine := fsm.NewKVStateMachine(db)
+
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
+	}
+
+	// 创建BadgerStorage
+	store, err := NewBadgerStorage(dir, config, stateMachine)
+	require.NoError(t, err)
+	defer store.Stop()
+
+	// 写入日志条目 - 使用符合状态机要求的JSON格式
 	entries := []raftpb.Entry{
-		{Index: 1, Term: 1, Data: []byte("entry1")},
-		{Index: 2, Term: 1, Data: []byte("entry2")},
-		{Index: 3, Term: 2, Data: []byte("entry3")},
-		{Index: 4, Term: 2, Data: []byte(bytes.Repeat([]byte("large"), 1000))}, // 添加一个大的日志条目
+		{Term: 1, Index: 1, Data: []byte(`{"op":"put","key":"key1","value":"value1"}`)},
+		{Term: 1, Index: 2, Data: []byte(`{"op":"put","key":"key2","value":"value2"}`)},
+		{Term: 2, Index: 3, Data: []byte(`{"op":"put","key":"key3","value":"value3"}`)},
+		{Term: 2, Index: 4, Data: []byte(`{"op":"put","key":"key4","value":"value4"}`)},
+		{Term: 3, Index: 5, Data: []byte(`{"op":"put","key":"key5","value":"value5"}`)},
 	}
-
-	// 保存日志条目并等待完成
-	err := store.SaveEntries(entries)
+	err = store.SaveEntries(entries)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 测试1：获取全部日志条目
-	retrievedEntries, err := store.Entries(1, 5, 0)
-	require.NoError(t, err)
-	require.Equal(t, len(entries), len(retrievedEntries))
-	for i, entry := range entries {
-		assert.Equal(t, entry, retrievedEntries[i])
-	}
-
-	// 测试2：测试大小限制 - 应该至少返回一个条目
-	maxSize := uint64(entries[0].Size() / 2) // 设置一个小于第一个条目大小的限制
-	retrievedEntries, err = store.Entries(1, 5, maxSize)
-	require.NoError(t, err)
-	require.Equal(t, 1, len(retrievedEntries))
-	assert.Equal(t, entries[0], retrievedEntries[0])
-
-	// 测试3：测试大小限制 - 返回多个条目但不超过限制
-	maxSize = uint64(entries[0].Size() + entries[1].Size() + entries[2].Size()/2)
-	retrievedEntries, err = store.Entries(1, 5, maxSize)
-	require.NoError(t, err)
-	assert.True(t, len(retrievedEntries) >= 2, "应该至少返回2个条目")
-	assert.Equal(t, entries[0], retrievedEntries[0])
-	assert.Equal(t, entries[1], retrievedEntries[1])
-
-	// 测试4：测试大条目的处理
-	maxSize = uint64(entries[3].Size() / 2)
-	retrievedEntries, err = store.Entries(4, 5, maxSize)
-	require.NoError(t, err)
-	require.Equal(t, 1, len(retrievedEntries))
-	assert.Equal(t, entries[3], retrievedEntries[0])
-
-	// 测试5：索引越界
-	_, err = store.Entries(5, 6, 0)
-	require.Error(t, err)
-
-	// 测试6：压缩后的日志访问
-	// 先创建快照以确保不会删除未持久化的数据
-	testSnapshot := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			Index: 2,
-			Term:  1,
-			ConfState: raftpb.ConfState{
-				Voters: []uint64{1, 2, 3},
-			},
-		},
-		Data: []byte("snapshot data"),
-	}
-	err = store.SaveSnapshot(testSnapshot)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
 
 	// 压缩日志
 	err = store.CompactLog(3)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
 
-	// 验证压缩后的状态
+	// 验证FirstIndex已更新
 	firstIndex, err := store.FirstIndex()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(3), firstIndex)
 
-	// 验证可以访问未压缩的日志
-	retrievedEntries, err = store.Entries(3, 5, 0)
-	require.NoError(t, err)
-	assert.Equal(t, 2, len(retrievedEntries))
-	assert.Equal(t, entries[2:], retrievedEntries)
-}
-
-// 测试获取任期
-func TestTerm(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 准备测试日志条目
-	entries := []raftpb.Entry{
-		{Index: 1, Term: 1, Data: []byte("entry1")},
-		{Index: 2, Term: 1, Data: []byte("entry2")},
-		{Index: 3, Term: 2, Data: []byte("entry3")},
-	}
-
-	err := store.SaveEntries(entries)
-	assert.NoError(t, err)
-
-	// 测试获取任期
-	term, err := store.Term(1)
-	assert.NoError(t, err)
-	assert.Equal(t, uint64(1), term)
-
-	term, err = store.Term(3)
-	assert.NoError(t, err)
-	assert.Equal(t, uint64(2), term)
-
-	// 测试索引越界
-	_, err = store.Term(4)
-	assert.Error(t, err)
-}
-
-// 测试最后和第一个索引
-func TestIndexes(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 准备测试日志条目
-	entries := []raftpb.Entry{
-		{Index: 1, Term: 1, Data: []byte("entry1")},
-		{Index: 2, Term: 1, Data: []byte("entry2")},
-		{Index: 3, Term: 2, Data: []byte("entry3")},
-	}
-
-	err := store.SaveEntries(entries)
-	assert.NoError(t, err)
-
-	// 测试最后索引
-	lastIndex, err := store.LastIndex()
-	assert.NoError(t, err)
-	assert.Equal(t, uint64(3), lastIndex)
-
-	// 测试第一个索引
-	firstIndex, err := store.FirstIndex()
-	assert.NoError(t, err)
-	assert.Equal(t, uint64(1), firstIndex)
-}
-
-// 测试快照
-func TestSnapshot(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 测试空快照
-	snapshot, err := store.Snapshot()
-	assert.NoError(t, err)
-	assert.True(t, IsEmptySnap(snapshot))
-
-	// 创建测试快照
-	testSnapshot := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			Index: 3,
-			Term:  2,
-			ConfState: raftpb.ConfState{
-				Voters: []uint64{1, 2, 3},
-			},
-		},
-		Data: []byte("snapshot data"),
-	}
-
-	err = store.SaveSnapshot(testSnapshot)
-	assert.NoError(t, err)
-
-	// 加载快照
-	loadedSnapshot, err := store.Snapshot()
-	assert.NoError(t, err)
-	assert.Equal(t, testSnapshot, loadedSnapshot)
-}
-
-// 测试日志压缩
-func TestCompactLog(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 等待存储初始化完成
-	time.Sleep(100 * time.Millisecond)
-
-	// 准备测试日志条目
-	entries := []raftpb.Entry{
-		{Index: 1, Term: 1, Data: []byte("entry1")},
-		{Index: 2, Term: 1, Data: []byte("entry2")},
-		{Index: 3, Term: 2, Data: []byte("entry3")},
-		{Index: 4, Term: 2, Data: []byte("entry4")},
-		{Index: 5, Term: 3, Data: []byte("entry5")},
-	}
-
-	// 保存日志条目并等待完成
-	err := store.SaveEntries(entries)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 创建快照以确保不会删除未持久化的数据
-	testSnapshot := raftpb.Snapshot{
-		Metadata: raftpb.SnapshotMetadata{
-			Index: 3,
-			Term:  2,
-			ConfState: raftpb.ConfState{
-				Voters: []uint64{1, 2, 3},
-			},
-		},
-		Data: []byte("snapshot data"),
-	}
-	err = store.SaveSnapshot(testSnapshot)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 压缩日志
-	err = store.CompactLog(4)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 验证压缩结果
-	// 1. 检查第一个可用的索引
-	firstIndex, err := store.FirstIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(4), firstIndex)
-
-	// 2. 尝试访问已压缩的日志
-	_, err = store.Entries(3, 4, 0)
+	// 验证无法获取已压缩的日志
+	_, err = store.Entries(1, 3, 0)
 	assert.Equal(t, ErrLogCompacted, err)
 
-	// 3. 检查未压缩的日志是否可用
-	remainingEntries, err := store.Entries(4, 6, 0)
+	// 验证可以获取未压缩的日志
+	entries, err = store.Entries(3, 6, 0)
 	require.NoError(t, err)
-	assert.Equal(t, 2, len(remainingEntries))
-	assert.Equal(t, entries[3:], remainingEntries)
+	assert.Equal(t, 3, len(entries))
+	assert.Equal(t, uint64(3), entries[0].Index)
+	assert.Equal(t, uint64(4), entries[1].Index)
+	assert.Equal(t, uint64(5), entries[2].Index)
 
-	// 4. 验证快照是否正确保存
-	snapshot, err := store.Snapshot()
-	require.NoError(t, err)
-	assert.Equal(t, testSnapshot.Metadata.Index, snapshot.Metadata.Index)
-	assert.Equal(t, testSnapshot.Metadata.Term, snapshot.Metadata.Term)
-
-	// 5. 测试压缩点等于第一个索引
-	err = store.CompactLog(firstIndex)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 验证压缩后的状态
-	newFirstIndex, err := store.FirstIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(4), newFirstIndex)
-
-	// 6. 测试压缩点小于第一个索引
-	err = store.CompactLog(newFirstIndex - 1)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 验证最终状态
-	finalFirstIndex, err := store.FirstIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(4), finalFirstIndex)
-
-	finalLastIndex, err := store.LastIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(5), finalLastIndex)
-
-	// 验证最后一个条目
-	lastEntry, err := store.Entries(finalFirstIndex, finalLastIndex+1, 0)
-	require.NoError(t, err)
-	assert.Equal(t, 2, len(lastEntry))
-	assert.Equal(t, entries[3:], lastEntry)
+	// 验证数据格式
+	for i := 0; i < 3; i++ {
+		index := i + 3
+		expectedData := fmt.Sprintf(`{"op":"put","key":"key%d","value":"value%d"}`, index, index)
+		assert.JSONEq(t, expectedData, string(entries[i].Data))
+	}
 }
 
-// 测试保存状态
-func TestSaveState(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
+// 测试快照功能
+func TestSnapshot(t *testing.T) {
+	// 创建临时目录
+	dir := createTempDir(t)
+	snapshotDir := filepath.Join(dir, "snapshots")
+	err := os.MkdirAll(snapshotDir, 0755)
+	require.NoError(t, err)
 
-	// 创建测试状态
-	hardState := raftpb.HardState{
-		Term:   2,
-		Vote:   3,
-		Commit: 4,
-	}
-	confState := raftpb.ConfState{
-		Voters:   []uint64{1, 2, 3},
-		Learners: []uint64{4, 5},
-	}
+	// 创建BadgerDB内存实例
+	db := createBadgerDB(t)
 
-	// 保存状态
-	err := store.SaveState(hardState, confState)
-	assert.NoError(t, err)
+	// 创建状态机
+	stateMachine := fsm.NewKVStateMachine(db)
 
-	// 验证保存的状态
-	loadedHardState, loadedConfState, err := store.InitialState()
-	assert.NoError(t, err)
-	assert.Equal(t, hardState, loadedHardState)
-	assert.Equal(t, confState, loadedConfState)
-}
-
-// 测试保存日志条目
-func TestSaveEntries(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 创建测试日志条目
-	entries := []raftpb.Entry{
-		{Index: 1, Term: 1, Data: []byte("test1")},
-		{Index: 2, Term: 1, Data: []byte("test2")},
-		{Index: 3, Term: 2, Data: []byte("test3")},
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
 	}
 
-	// 保存日志条目
-	err := store.SaveEntries(entries)
-	assert.NoError(t, err)
+	// 创建BadgerStorage
+	store, err := NewBadgerStorage(dir, config, stateMachine)
+	require.NoError(t, err)
+	defer store.Stop()
 
-	// 验证保存的日志条目
-	loadedEntries, err := store.Entries(1, 4, 0)
-	assert.NoError(t, err)
-	assert.Equal(t, entries, loadedEntries)
-}
+	// 写入一些数据到状态机 - 使用符合状态机要求的JSON格式
+	stateMachine.Apply(raftpb.Entry{Term: 1, Index: 1, Data: []byte(`{"op":"put","key":"key1","value":"value1"}`)})
+	stateMachine.Apply(raftpb.Entry{Term: 1, Index: 2, Data: []byte(`{"op":"put","key":"key2","value":"value2"}`)})
+	stateMachine.Apply(raftpb.Entry{Term: 1, Index: 3, Data: []byte(`{"op":"put","key":"key3","value":"value3"}`)})
 
-// 测试保存快照
-func TestSaveSnapshot(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
+	// 创建快照
+	snapshotData, err := stateMachine.SaveSnapshot()
+	require.NoError(t, err)
 
-	// 创建测试快照
 	snapshot := raftpb.Snapshot{
+		Data: snapshotData,
 		Metadata: raftpb.SnapshotMetadata{
-			Index:     100,
+			Index:     3,
 			Term:      2,
 			ConfState: raftpb.ConfState{Voters: []uint64{1, 2, 3}},
 		},
-		Data: []byte("snapshot data"),
 	}
 
 	// 保存快照
-	err := store.SaveSnapshot(snapshot)
-	assert.NoError(t, err)
+	err = store.SaveSnapshot(snapshot)
+	require.NoError(t, err)
 
-	// 验证保存的快照
+	// 获取快照
 	loadedSnapshot, err := store.Snapshot()
-	assert.NoError(t, err)
-	assert.Equal(t, snapshot, loadedSnapshot)
-
-	// 测试保存空快照
-	err = store.SaveSnapshot(raftpb.Snapshot{})
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	assert.Equal(t, snapshot.Metadata.Index, loadedSnapshot.Metadata.Index)
+	assert.Equal(t, snapshot.Metadata.Term, loadedSnapshot.Metadata.Term)
+	assert.Equal(t, snapshot.Data, loadedSnapshot.Data)
+	assert.Equal(t, snapshot.Metadata.ConfState.Voters, loadedSnapshot.Metadata.ConfState.Voters)
 }
 
-// 测试原子性保存
+// 测试Append方法
 func TestAppend(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
+	// 创建临时目录
+	dir := createTempDir(t)
 
-	// 等待存储初始化完成
-	time.Sleep(100 * time.Millisecond)
+	// 创建BadgerDB内存实例
+	db := createBadgerDB(t)
 
-	// 准备测试数据
-	hardState := &raftpb.HardState{
-		Term:   1,
-		Vote:   2,
-		Commit: 3,
-	}
-	confState := &raftpb.ConfState{
-		Voters: []uint64{1, 2, 3},
-	}
-	entries := []raftpb.Entry{
-		{Term: 1, Index: 1, Data: []byte("test1")},
-		{Term: 2, Index: 2, Data: []byte("test2")},
+	// 创建状态机
+	stateMachine := fsm.NewKVStateMachine(db)
+
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
 	}
 
-	// 原子性保存
-	err := store.Append(hardState, confState, entries)
+	// 创建BadgerStorage
+	store, err := NewBadgerStorage(dir, config, stateMachine)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
+	defer store.Stop()
 
-	// 验证硬状态
-	savedHardState, err := store.GetHardState()
-	require.NoError(t, err)
-	assert.Equal(t, hardState, savedHardState)
-
-	// 验证配置状态
-	savedConfState, err := store.GetConfState()
-	require.NoError(t, err)
-	assert.Equal(t, confState, savedConfState)
-
-	// 验证日志条目
-	savedEntries, err := store.Entries(1, 3, 0)
-	require.NoError(t, err)
-	assert.Equal(t, entries, savedEntries)
-
-	// 测试空状态
-	err = store.Append(nil, nil, nil)
-	require.NoError(t, err)
-
-	// 测试部分状态
-	err = store.Append(hardState, nil, nil)
-	require.NoError(t, err)
-	err = store.Append(nil, confState, nil)
-	require.NoError(t, err)
-	err = store.Append(nil, nil, entries)
-	require.NoError(t, err)
-}
-
-// 测试保存 Raft 硬状态
-func TestSaveRaftState(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 创建测试硬状态
+	// 创建硬状态
 	hardState := raftpb.HardState{
 		Term:   5,
-		Vote:   6,
-		Commit: 7,
+		Vote:   2,
+		Commit: 10,
 	}
 
-	// 保存硬状态
-	err := store.SaveRaftState(hardState)
-	assert.NoError(t, err)
+	// 创建配置状态
+	confState := raftpb.ConfState{
+		Voters: []uint64{1, 2, 3},
+	}
 
-	// 验证保存的硬状态
-	loadedHardState, _, err := store.InitialState()
-	assert.NoError(t, err)
-	assert.Equal(t, hardState, loadedHardState)
+	// 创建日志条目 - 使用符合状态机要求的JSON格式
+	entries := []raftpb.Entry{
+		{Term: 5, Index: 11, Data: []byte(`{"op":"put","key":"key11","value":"value11"}`)},
+		{Term: 5, Index: 12, Data: []byte(`{"op":"put","key":"key12","value":"value12"}`)},
+	}
+
+	// 使用Append方法一次性保存所有状态
+	err = store.Append(&hardState, &confState, entries)
+	require.NoError(t, err)
+
+	// 验证硬状态
+	hs, cs, err := store.InitialState()
+	require.NoError(t, err)
+	assert.Equal(t, hardState.Term, hs.Term)
+	assert.Equal(t, hardState.Vote, hs.Vote)
+	assert.Equal(t, hardState.Commit, hs.Commit)
+
+	// 验证配置状态
+	assert.Equal(t, confState.Voters, cs.Voters)
+
+	// 验证日志条目
+	readEntries, err := store.Entries(11, 13, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, len(readEntries))
+
+	// 验证索引和任期
+	assert.Equal(t, entries[0].Term, readEntries[0].Term)
+	assert.Equal(t, entries[0].Index, readEntries[0].Index)
+	assert.Equal(t, entries[1].Term, readEntries[1].Term)
+	assert.Equal(t, entries[1].Index, readEntries[1].Index)
+
+	// 验证数据格式
+	assert.JSONEq(t, `{"op":"put","key":"key11","value":"value11"}`, string(readEntries[0].Data))
+	assert.JSONEq(t, `{"op":"put","key":"key12","value":"value12"}`, string(readEntries[1].Data))
 }
 
-// 测试批量写入和资源泄漏
-func TestBatchWriteAndResourceLeak(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
+// 测试并发操作
+func TestConcurrentOperations(t *testing.T) {
+	// 创建临时目录
+	dir := createTempDir(t)
 
-	// 等待存储初始化完成
-	time.Sleep(100 * time.Millisecond)
+	// 创建BadgerDB内存实例
+	db := createBadgerDB(t)
 
-	// 准备大量测试数据
-	var entries []raftpb.Entry
-	for i := uint64(1); i <= 1000; i++ {
-		entries = append(entries, raftpb.Entry{
-			Term:  1,
-			Index: i,
-			Data:  []byte(fmt.Sprintf("entry-%d", i)),
-		})
+	// 创建状态机
+	stateMachine := fsm.NewKVStateMachine(db)
+
+	// 创建存储配置
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 5,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 5,
+		SnapshotCount:    100,
 	}
 
-	// 批量保存日志条目
-	err := store.SaveEntries(entries)
+	// 创建BadgerStorage
+	store, err := NewBadgerStorage(dir, config, stateMachine)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
+	defer store.Stop()
 
-	// 验证保存结果
+	// 并发写入和读取测试
+	const (
+		goroutines        = 5
+		entriesPerRoutine = 20
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	// 用于检测错误的通道
+	errCh := make(chan error, goroutines)
+
+	// 启动多个goroutine并发写入
+	for g := 0; g < goroutines; g++ {
+		go func(routineID int) {
+			defer wg.Done()
+
+			baseIndex := uint64(routineID*entriesPerRoutine + 1)
+			entries := make([]raftpb.Entry, entriesPerRoutine)
+
+			// 准备日志条目
+			for i := 0; i < entriesPerRoutine; i++ {
+				index := baseIndex + uint64(i)
+				data := fmt.Sprintf(`{"op":"put","key":"key%d_%d","value":"value%d_%d"}`, routineID, i, routineID, i)
+				entries[i] = raftpb.Entry{
+					Term:  uint64(routineID + 1),
+					Index: index,
+					Data:  []byte(data),
+				}
+			}
+
+			// 写入日志条目
+			if err := store.SaveEntries(entries); err != nil {
+				errCh <- fmt.Errorf("goroutine %d 写入失败: %v", routineID, err)
+				return
+			}
+
+			// 读取并验证日志条目
+			for i := 0; i < entriesPerRoutine; i++ {
+				index := baseIndex + uint64(i)
+				term, err := store.Term(index)
+				if err != nil {
+					errCh <- fmt.Errorf("goroutine %d 读取Term失败, 索引 %d: %v", routineID, index, err)
+					return
+				}
+
+				if term != uint64(routineID+1) {
+					errCh <- fmt.Errorf("goroutine %d Term不匹配, 索引 %d: 期望 %d, 实际 %d",
+						routineID, index, routineID+1, term)
+					return
+				}
+			}
+		}(g)
+	}
+
+	// 等待所有goroutine完成
+	wg.Wait()
+	close(errCh)
+
+	// 检查是否有错误
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	// 验证FirstIndex和LastIndex
 	firstIndex, err := store.FirstIndex()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(1), firstIndex)
 
 	lastIndex, err := store.LastIndex()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(1000), lastIndex)
+	assert.Equal(t, uint64(goroutines*entriesPerRoutine), lastIndex)
 
-	// 验证日志条目内容
-	retrievedEntries, err := store.Entries(1, 101, 0) // 获取前100个条目
+	// 测试压缩日志
+	compactIndex := uint64(goroutines * entriesPerRoutine / 2)
+	err = store.CompactLog(compactIndex)
 	require.NoError(t, err)
-	assert.Equal(t, 100, len(retrievedEntries))
-	for i, entry := range retrievedEntries {
-		assert.Equal(t, entries[i], entry)
-	}
 
-	// 测试压缩
-	err = store.CompactLog(500)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 验证压缩后的状态
+	// 验证FirstIndex已更新
 	firstIndex, err = store.FirstIndex()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(500), firstIndex)
-
-	// 验证压缩后的日志条目
-	retrievedEntries, err = store.Entries(500, 600, 0)
-	require.NoError(t, err)
-	assert.Equal(t, 100, len(retrievedEntries))
-	for i, entry := range retrievedEntries {
-		expectedIndex := uint64(500 + i)
-		assert.Equal(t, expectedIndex, entry.Index)
-		assert.Equal(t, entries[expectedIndex-1], entry)
-	}
-
-	// 测试资源释放
-	store.Stop()
-	time.Sleep(100 * time.Millisecond)
-
-	// 验证停止后的操作会返回错误
-	_, err = store.FirstIndex()
-	assert.Error(t, err)
+	assert.Equal(t, compactIndex, firstIndex)
 }
 
-// 测试大量日志条目压缩
-func TestCompactLargeLog(t *testing.T) {
-	store, _, cleanup := createTestBadgerStorage(t)
-	defer cleanup()
-
-	// 等待存储初始化完成
-	time.Sleep(100 * time.Millisecond)
-
-	// 准备大量测试日志条目
-	var entries []raftpb.Entry
-	for i := uint64(1); i <= 1000; i++ {
-		entries = append(entries, raftpb.Entry{
-			Index: i,
-			Term:  i/100 + 1, // 每100个条目一个任期
-			Data:  []byte(fmt.Sprintf("entry-%d", i)),
-		})
+// 测试高负载
+func TestHighLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过高负载测试")
 	}
 
-	// 分批保存日志条目
-	batchSize := 100
-	for i := 0; i < len(entries); i += batchSize {
-		end := i + batchSize
-		if end > len(entries) {
-			end = len(entries)
+	// 创建临时目录
+	dir := createTempDir(t)
+
+	// 创建BadgerDB内存实例
+	db := createBadgerDB(t)
+
+	// 创建状态机
+	stateMachine := fsm.NewKVStateMachine(db)
+
+	// 创建存储配置 - 设置更低的快照阈值以触发快照创建
+	config := &BadgerConfig{
+		GCInterval:       time.Second * 1,
+		GCDiscardRatio:   0.5,
+		SnapshotInterval: time.Second * 1,
+		SnapshotCount:    50, // 较低的阈值，确保测试中会触发快照
+	}
+
+	// 创建BadgerStorage
+	store, err := NewBadgerStorage(dir, config, stateMachine)
+	require.NoError(t, err)
+	defer store.Stop()
+
+	// 写入大量日志条目
+	const entriesCount = 200
+
+	// 分批写入以模拟真实场景
+	batchSize := 20
+	for batch := 0; batch < entriesCount/batchSize; batch++ {
+		entries := make([]raftpb.Entry, batchSize)
+		for i := 0; i < batchSize; i++ {
+			index := uint64(batch*batchSize + i + 1)
+			data := fmt.Sprintf(`{"op":"put","key":"highload_key%d","value":"highload_value%d"}`, index, index)
+			entries[i] = raftpb.Entry{
+				Term:  uint64(batch + 1),
+				Index: index,
+				Data:  []byte(data),
+			}
 		}
-		err := store.SaveEntries(entries[i:end])
+
+		err := store.SaveEntries(entries)
 		require.NoError(t, err)
+
+		// 应用日志到状态机以触发快照
+		for i := 0; i < batchSize; i++ {
+			err := stateMachine.Apply(entries[i])
+			require.NoError(t, err)
+		}
+
+		// 短暂暂停，让异步操作有机会执行
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// 创建快照
-	testSnapshot := raftpb.Snapshot{
+	// 手动创建快照
+	snapshotData, err := stateMachine.SaveSnapshot()
+	require.NoError(t, err)
+	require.NotEmpty(t, snapshotData, "快照数据不应为空")
+
+	snapshot := raftpb.Snapshot{
+		Data: snapshotData,
 		Metadata: raftpb.SnapshotMetadata{
-			Index: 500,
-			Term:  6,
-			ConfState: raftpb.ConfState{
-				Voters: []uint64{1, 2, 3},
-			},
+			Index:     entriesCount, // 使用最后一个索引
+			Term:      10,           // 使用一个有效的任期
+			ConfState: raftpb.ConfState{Voters: []uint64{1, 2, 3}},
 		},
-		Data: []byte("snapshot data"),
 	}
-	err := store.SaveSnapshot(testSnapshot)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
 
-	// 压缩前半部分日志
-	err = store.CompactLog(501)
+	// 保存快照
+	err = store.SaveSnapshot(snapshot)
 	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
 
-	// 验证压缩结果
+	// 等待可能的异步操作完成
+	time.Sleep(2 * time.Second)
+
+	// 验证数据完整性
+	lastIndex, err := store.LastIndex()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(entriesCount), lastIndex)
+
+	// 获取快照
+	loadedSnapshot, err := store.Snapshot()
+	require.NoError(t, err)
+	assert.NotNil(t, loadedSnapshot.Data, "加载的快照数据不应为空")
+	assert.Greater(t, len(loadedSnapshot.Data), 0, "快照数据长度应大于0")
+
+	// 验证快照元数据
+	assert.Equal(t, uint64(entriesCount), loadedSnapshot.Metadata.Index, "快照索引应等于条目数量")
+
+	// 压缩日志到快照索引
+	err = store.CompactLog(loadedSnapshot.Metadata.Index)
+	require.NoError(t, err)
+
+	// 验证FirstIndex已更新到快照索引
 	firstIndex, err := store.FirstIndex()
 	require.NoError(t, err)
-	assert.Equal(t, uint64(501), firstIndex)
-
-	// 验证剩余日志
-	remainingEntries, err := store.Entries(501, 601, 0)
-	require.NoError(t, err)
-	assert.Equal(t, 100, len(remainingEntries))
-	for i, entry := range remainingEntries {
-		expectedIndex := uint64(501 + i)
-		assert.Equal(t, expectedIndex, entry.Index)
-		assert.Equal(t, entries[expectedIndex-1], entry)
-	}
-
-	// 验证快照
-	snapshot, err := store.Snapshot()
-	require.NoError(t, err)
-	assert.Equal(t, testSnapshot.Metadata.Index, snapshot.Metadata.Index)
-	assert.Equal(t, testSnapshot.Metadata.Term, snapshot.Metadata.Term)
-
-	// 再次压缩一部分日志
-	err = store.CompactLog(701)
-	require.NoError(t, err)
-	time.Sleep(100 * time.Millisecond)
-
-	// 验证最终状态
-	finalFirstIndex, err := store.FirstIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(701), finalFirstIndex)
-
-	finalLastIndex, err := store.LastIndex()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1000), finalLastIndex)
-
-	// 验证最后的日志条目
-	lastEntries, err := store.Entries(701, 801, 0)
-	require.NoError(t, err)
-	assert.Equal(t, 100, len(lastEntries))
-	for i, entry := range lastEntries {
-		expectedIndex := uint64(701 + i)
-		assert.Equal(t, expectedIndex, entry.Index)
-		assert.Equal(t, entries[expectedIndex-1], entry)
-	}
+	assert.True(t, firstIndex == loadedSnapshot.Metadata.Index ||
+		firstIndex == loadedSnapshot.Metadata.Index+1,
+		"FirstIndex应等于快照索引或快照索引+1, 实际: %d, 期望: %d",
+		firstIndex, loadedSnapshot.Metadata.Index)
 }

@@ -148,6 +148,33 @@ message RaftMessageResponse {
   uint64 sequence = 5;               // 响应的消息序列号
 }
 
+// GetLeaderInfoRequest 获取领导者信息请求
+message GetLeaderInfoRequest {
+  uint64 from = 1;
+  uint64 to = 2;
+}
+
+// GetLeaderInfoResponse 获取领导者信息响应
+message GetLeaderInfoResponse {
+  uint64 leader_id = 1;
+  uint64 term = 2;
+  bool success = 3;
+  string error = 4;
+}
+
+// ConfChangeRequest 配置变更请求
+message ConfChangeRequest {
+  uint64 from = 1;
+  uint64 to = 2;
+  bytes conf_change = 3;
+}
+
+// ConfChangeResponse 配置变更响应
+message ConfChangeResponse {
+  bool success = 1;
+  string error = 2;
+}
+
 // RaftService 定义了 Raft 节点间通信的 gRPC 服务
 service RaftService {
   // SendMessage 用于发送单个 Raft 消息
@@ -161,4 +188,10 @@ service RaftService {
 
   // SendSnapshot 用于传输快照数据块
   rpc SendSnapshot(stream SnapshotChunk) returns (stream SnapshotResponse) {}
+
+  // GetLeaderInfo 获取领导者信息
+  rpc GetLeaderInfo(GetLeaderInfoRequest) returns (GetLeaderInfoResponse) {}
+
+  // SendConfChange 发送配置变更请求
+  rpc SendConfChange(ConfChangeRequest) returns (ConfChangeResponse) {}
 } 
